@@ -663,7 +663,35 @@ def get_column_data():
     except Exception as e:
         app.logger.error(f"Error getting column data: {str(e)}")
         return jsonify({'error': str(e)}), 500
-    
+
+# Add this route to app.py
+@app.route('/api/columns/<string:column_id>', methods=['DELETE'])
+@jwt_required()
+def delete_column(column_id):
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        # Get column details
+        column = db.get_column_by_id(column_id)
+        if not column:
+            return jsonify({'error': 'Column not found'}), 404
+            
+        # Check permissions
+        if not user.get('is_admin') and column['created_by'] != current_user and column.get('is_global', False):
+            return jsonify({'error': 'Unauthorized to delete this column'}), 403
+            
+        # Delete the column
+        result = db.delete_column(column_id)
+        if result.get('error'):
+            return jsonify(result), 400
+            
+        return jsonify({'message': 'Column deleted successfully'})
+        
+    except Exception as e:
+        app.logger.error(f"Error deleting column: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 # Error handlers
 @app.errorhandler(500)
 def handle_500_error(e):

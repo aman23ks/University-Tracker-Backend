@@ -567,3 +567,70 @@ class MongoDB:
         except Exception as e:
             logger.error(f"Error saving column data: {str(e)}")
             return {'error': str(e)}
+
+    # Add these methods to the MongoDB class in database.py
+
+    def get_column_by_id(self, column_id: str) -> Optional[Dict]:
+        """Get column by ID"""
+        try:
+            # Convert string ID to ObjectId
+            obj_id = ObjectId(column_id)
+            column = self.custom_columns.find_one({'_id': obj_id})
+            if column:
+                column['_id'] = str(column['_id'])
+            return column
+        except Exception as e:
+            logger.error(f"Error getting column by ID: {str(e)}")
+            return None
+
+    def delete_column(self, column_id: str) -> Dict:
+        """Delete a custom column and its associated data"""
+        try:
+            # Convert string ID to ObjectId
+            obj_id = ObjectId(column_id)
+            
+            # Start a session for transaction
+            with self.client.start_session() as session:
+                with session.start_transaction():
+                    # Delete the column definition
+                    column_result = self.custom_columns.delete_one(
+                        {'_id': obj_id},
+                        session=session
+                    )
+                    
+                    if column_result.deleted_count == 0:
+                        return {'error': 'Column not found'}
+                    
+                    # Delete all associated column data
+                    self.column_data.delete_many(
+                        {'column_id': str(obj_id)},
+                        session=session
+                    )
+                    
+            return {'success': True}
+            
+        except Exception as e:
+            logger.error(f"Error deleting column: {str(e)}")
+            return {'error': str(e)}
+
+    def get_column_usage(self, column_id: str) -> Dict:
+        """Get usage statistics for a column"""
+        try:
+            # Get count of data entries
+            data_count = self.column_data.count_documents({'column_id': column_id})
+            
+            # Get unique universities using this column
+            unique_universities = len(self.column_data.distinct('university_id', {'column_id': column_id}))
+            
+            # Get unique users using this column
+            unique_users = len(self.column_data.distinct('user_email', {'column_id': column_id}))
+            
+            return {
+                'data_entries': data_count,
+                'universities': unique_universities,
+                'users': unique_users
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting column usage: {str(e)}")
+            return {'error': str(e)}
