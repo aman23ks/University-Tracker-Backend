@@ -1,0 +1,10 @@
+flask
+flask-cors
+flask-jwt-extended
+pymongo
+openai
+pinecone-client
+python-dotenv
+werkzeug
+cohere
+requests
