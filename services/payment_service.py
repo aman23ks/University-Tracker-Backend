@@ -1,3 +1,5 @@
+# /backend/services/payment_service.py
+
 import razorpay
 from typing import Dict
 import logging
@@ -8,11 +10,13 @@ logger = logging.getLogger(__name__)
 class PaymentService:
     def __init__(self, key_id: str, key_secret: str):
         self.client = razorpay.Client(auth=(key_id, key_secret))
+        self.key_id = key_id
+        self.key_secret = key_secret
     
     def create_order(self, amount: int, user_email: str) -> Dict:
         try:
             data = {
-                'amount': amount * 100,  # Convert to paise
+                'amount': amount,  # Amount should already be in paise
                 'currency': 'INR',
                 'payment_capture': 1,
                 'notes': {
@@ -67,7 +71,7 @@ class PaymentService:
                 'interval': 1,
                 'item': {
                     'name': 'Premium Subscription',
-                    'amount': 2000,
+                    'amount': 2000,  # ₹20 in paise
                     'currency': 'INR'
                 }
             }
@@ -80,3 +84,25 @@ class PaymentService:
         except Exception as e:
             logger.error(f"Subscription creation failed: {str(e)}")
             return {'success': False, 'error': str(e)}
+
+    def verify_subscription_payment(self, data: Dict) -> bool:
+        try:
+            self.client.utility.verify_payment_signature(data)
+            return True
+        except Exception as e:
+            logger.error(f"Subscription payment verification failed: {str(e)}")
+            return False
+
+    def fetch_subscription(self, subscription_id: str) -> Dict:
+        try:
+            subscription = self.client.subscription.fetch(subscription_id)
+            return {
+                'success': True,
+                'subscription': subscription
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch subscription: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }

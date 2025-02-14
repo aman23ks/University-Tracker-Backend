@@ -1,6 +1,7 @@
 from flask import Flask, make_response, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import timedelta
 import os
 import json
@@ -691,6 +692,193 @@ def delete_column(column_id):
     except Exception as e:
         app.logger.error(f"Error deleting column: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/subscription/create-order', methods=['POST'])
+@jwt_required()
+def create_subscription_order():
+    try:
+        user_email = get_jwt_identity()
+        print(f"Creating order for user: {user_email}")
+        
+        # Fixed amount for premium subscription (₹20 = 2000 paise)
+        amount = 2000
+        
+        order_response = payment.create_order(amount, user_email)
+        if not order_response['success']:
+            return jsonify({'error': 'Failed to create order'}), 400
+            
+        return jsonify(order_response['order'])
+        
+    except Exception as e:
+        print(f"Error creating subscription order: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/subscription/verify', methods=['POST'])
+@jwt_required()
+def verify_subscription():
+    try:
+        user_email = get_jwt_identity()
+        data = request.json
+        print(f"Verifying payment for user: {user_email}")
+        print(f"Verification data: {data}")
+        
+        # Verify payment signature
+        if not payment.verify_payment(
+            data['payment_id'],
+            data['order_id'],
+            data['signature']
+        ):
+            return jsonify({'error': 'Invalid payment signature'}), 400
+            
+        # Get payment details
+        payment_details = payment.get_payment_details(data['payment_id'])
+        if not payment_details['success']:
+            return jsonify({'error': 'Failed to fetch payment details'}), 400
+            
+        # Update user subscription
+        expiry_date = datetime.utcnow() + timedelta(days=30)
+        update_data = {
+            'is_premium': True,
+            'subscription': {
+                'status': 'active',
+                'expiry': expiry_date,
+                'payment_history': [{
+                    'payment_id': data['payment_id'],
+                    'amount': payment_details['payment']['amount'] / 100,
+                    'timestamp': datetime.utcnow()
+                }]
+            }
+        }
+        
+        result = db.update_user(user_email, update_data)
+        if result.get('error'):
+            return jsonify({'error': result['error']}), 400
+            
+        return jsonify({
+            'success': True,
+            'message': 'Subscription activated successfully'
+        })
+        
+    except Exception as e:
+        print(f"Error verifying subscription: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/subscription/status', methods=['GET'])
+@jwt_required()
+def get_subscription_status():
+    try:
+        user_email = get_jwt_identity()
+        user = db.get_user(user_email)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+            
+        return jsonify({
+            'is_premium': user.get('is_premium', False),
+            'subscription': user.get('subscription', {
+                'status': 'free',
+                'expiry': None
+            })
+        })
+        
+    except Exception as e:
+        print(f"Error getting subscription status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/subscription/cancel', methods=['POST'])
+@jwt_required()
+def cancel_subscription():
+    try:
+        user_email = get_jwt_identity()
+        result = db.update_user(user_email, {
+            'subscription.status': 'cancelled',
+            'subscription.cancel_at_period_end': True
+        })
+        
+        if result.get('error'):
+            return jsonify({'error': result['error']}), 400
+            
+        return jsonify({
+            'success': True,
+            'message': 'Subscription will be cancelled at the end of the billing period'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/users/profile', methods=['GET'])
+@jwt_required()
+def get_profile():
+    try:
+        user_email = get_jwt_identity()
+        user = db.get_user(user_email)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+            
+        return jsonify({
+            'email': user['email'],
+            'is_premium': user.get('is_premium', False),
+            'subscription': user.get('subscription', {
+                'status': 'free',
+                'expiry': None
+            }),
+            'created_at': user.get('created_at')
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+
+@app.route('/api/users/profile', methods=['PUT'])
+@jwt_required()
+def update_profile():
+    try:
+        user_email = get_jwt_identity()
+        data = request.json
+        print("-------user email--------")
+        print(user_email)
+        print(data)
+        # Verify current password if trying to change password
+        if data.get('newPassword'):
+            user = db.verify_user({
+                'email': user_email,
+                'password': data['currentPassword']
+            })
+            print("------user-------")
+            print(user)
+            if 'error' in user:
+                return jsonify({'error': 'Current password is incorrect'}), 400
+            
+            # Update password
+            data['password'] = generate_password_hash(data['newPassword'])
+        
+        print("-----------data-------")
+        print(data)
+        # Remove sensitive fields from update data
+        update_data = {
+            'email': data.get('email'),
+            'password': data.get('password')  # Only included if password was changed
+        }
+        update_data = {k: v for k, v in update_data.items() if v is not None}
+        print("-------------update data--------")
+        print(update_data)
+        result = db.update_user(user_email, update_data)
+        print("------------result----------")
+        print(result)
+        if result.get('error'):
+            return jsonify({'error': result['error']}), 400
+            
+        # Get updated user data
+        updated_user = db.get_user(data.get('email', user_email)) 
+        return jsonify({
+            'email': updated_user['email'],
+            'is_premium': updated_user.get('is_premium', False),
+            'subscription': updated_user.get('subscription', {'status': 'free'})
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 # Error handlers
 @app.errorhandler(500)

@@ -91,6 +91,7 @@ class MongoDB:
             
             return {
                 'email': user['email'],
+                'password': user['password'],
                 'is_premium': user['is_premium'],
                 'is_admin': user['is_admin'],
                 'selected_universities': user['selected_universities'],
@@ -234,7 +235,7 @@ class MongoDB:
         try:
             safe_update_data = {
                 k: v for k, v in update_data.items() 
-                if k not in ['password', 'email', 'is_admin', '_id']
+                if k not in ['email', 'is_admin', '_id']
             }
 
             if not safe_update_data:
