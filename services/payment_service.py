@@ -22,7 +22,7 @@ class PaymentService:
                 'notes': {
                     'user_email': user_email,
                     'plan': 'premium',
-                    'valid_until': (datetime.utcnow() + timedelta(days=30)).isoformat()
+                    'valid_until': (datetime.utcnow() + timedelta(minutes=1)).isoformat()
                 }
             }
             order = self.client.order.create(data=data)

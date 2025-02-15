@@ -11,7 +11,7 @@ from services.database import MongoDB
 from services.rag_retrieval import RAGRetrieval
 from services.payment_service import PaymentService
 from services.hybrid_crawler import HybridCrawler
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import json_util, ObjectId
 import json
 from typing import List, Dict
@@ -701,7 +701,7 @@ def create_subscription_order():
         print(f"Creating order for user: {user_email}")
         
         # Fixed amount for premium subscription (₹20 = 2000 paise)
-        amount = 2000
+        amount = 100000
         
         order_response = payment.create_order(amount, user_email)
         if not order_response['success']:
@@ -763,28 +763,53 @@ def verify_subscription():
         print(f"Error verifying subscription: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+# Add this function to your app.py
 @app.route('/api/subscription/status', methods=['GET'])
 @jwt_required()
-def get_subscription_status():
+def check_subscription_status():
     try:
         user_email = get_jwt_identity()
         user = db.get_user(user_email)
         
         if not user:
             return jsonify({'error': 'User not found'}), 404
-            
+
+        # Check if subscription has expired
+        if user.get('subscription'):
+            expiry = user['subscription'].get('expiry')
+            if expiry:
+                # MongoDB returns datetime, ensure it's UTC
+                expiry_date = expiry.replace(tzinfo=timezone.utc) if isinstance(expiry, datetime) else datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+                current_time = datetime.now(timezone.utc)
+
+                if current_time > expiry_date:
+                    # Update user status to expired
+                    db.update_user(user_email, {
+                        'is_premium': False,
+                        'subscription': {
+                            'status': 'expired',
+                            'expiry': expiry,
+                            'paymentHistory': user['subscription'].get('paymentHistory', [])
+                        }
+                    })
+                    return jsonify({
+                        'is_premium': False,
+                        'subscription': {
+                            'status': 'expired',
+                            'expiry': expiry.isoformat() if isinstance(expiry, datetime) else expiry
+                        }
+                    })
+
+        # Return current status if not expired
         return jsonify({
             'is_premium': user.get('is_premium', False),
-            'subscription': user.get('subscription', {
-                'status': 'free',
-                'expiry': None
-            })
+            'subscription': user.get('subscription', {'status': 'free'})
         })
         
     except Exception as e:
-        print(f"Error getting subscription status: {str(e)}")
+        app.logger.error(f"Error checking subscription status: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
+    
 @app.route('/api/subscription/cancel', methods=['POST'])
 @jwt_required()
 def cancel_subscription():
