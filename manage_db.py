@@ -19,6 +19,13 @@ def setup_indexes(db):
         ('user_email', ASCENDING),
         ('university_url', ASCENDING)
     ], unique=True)
+    
+    # Add this to your MongoDB initialization
+    db.activity_logs.create_index([
+        ('timestamp', 1),
+        ('type', 1),
+        ('user_id', 1)
+    ])
 
 def cleanup_expired_subscriptions(db):
     now = datetime.utcnow()
@@ -41,8 +48,8 @@ def cli():
     pass
 
 @cli.command()
-@click.option('--uri', default='mongodb://localhost:27017/', help='MongoDB URI')
-@click.option('--db-name', default='university_tracker', help='Database name')
+@click.option('--uri', default='mongodb://localhost:27017/', help='mongodb+srv://amanshrivastava230800:zuT5KtvEfxROOsfQ@cluster0.pihxb.mongodb.net/uni-track-test?retryWrites=true&w=majority&appName=Cluster0')
+@click.option('--db-name', default='university_tracker', help='university_tracker')
 def init(uri, db_name):
     """Initialize database with required indexes"""
     client = MongoClient(uri)
@@ -51,8 +58,8 @@ def init(uri, db_name):
     click.echo('Indexes created successfully')
 
 @cli.command()
-@click.option('--uri', default='mongodb://localhost:27017/', help='MongoDB URI')
-@click.option('--db-name', default='university_tracker', help='Database name')
+@click.option('--uri', default='mongodb://localhost:27017/', help='mongodb+srv://amanshrivastava230800:zuT5KtvEfxROOsfQ@cluster0.pihxb.mongodb.net/uni-track-test?retryWrites=true&w=majority&appName=Cluster0')
+@click.option('--db-name', default='university_tracker', help='university_tracker')
 def cleanup(uri, db_name):
     """Cleanup expired subscriptions"""
     client = MongoClient(uri)
@@ -61,8 +68,8 @@ def cleanup(uri, db_name):
     click.echo(f'Cleaned up {count} expired subscriptions')
 
 @cli.command()
-@click.option('--uri', default='mongodb://localhost:27017/', help='MongoDB URI')
-@click.option('--db-name', default='university_tracker', help='Database name')
+@click.option('--uri', default='mongodb://localhost:27017/', help='mongodb+srv://amanshrivastava230800:zuT5KtvEfxROOsfQ@cluster0.pihxb.mongodb.net/uni-track-test?retryWrites=true&w=majority&appName=Cluster0')
+@click.option('--db-name', default='university_tracker', help='university_tracker')
 @click.argument('backup_file')
 def backup(uri, db_name, backup_file):
     """Backup database to a file"""
@@ -81,8 +88,8 @@ def backup(uri, db_name, backup_file):
     click.echo(f'Backup saved to {backup_file}')
 
 @cli.command()
-@click.option('--uri', default='mongodb://localhost:27017/', help='MongoDB URI')
-@click.option('--db-name', default='university_tracker', help='Database name')
+@click.option('--uri', default='mongodb://localhost:27017/', help='mongodb+srv://amanshrivastava230800:zuT5KtvEfxROOsfQ@cluster0.pihxb.mongodb.net/uni-track-test?retryWrites=true&w=majority&appName=Cluster0')
+@click.option('--db-name', default='university_tracker', help='university_tracker')
 @click.argument('backup_file')
 def restore(uri, db_name, backup_file):
     """Restore database from a backup file"""

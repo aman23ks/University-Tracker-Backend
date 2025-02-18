@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from bson import json_util, ObjectId
 import json
 from typing import List, Dict
+from services.analytics import get_monthly_growth, get_user_activity, get_total_revenue
 
 load_dotenv()
 app = Flask(__name__)
@@ -151,7 +152,9 @@ async def add_university():
     
     try:
         data = request.json
-        if not data or 'url' not in data or 'program' not in data:
+        print("----------data------")
+        print(data)
+        if not data or 'url' not in data or 'program' not in data or 'name' not in data:
             return jsonify({'error': 'Missing required fields'}), 400
 
         # Process university data with crawler
@@ -165,6 +168,7 @@ async def add_university():
 
         # Add to database
         university_data = {
+            'name': data['name'],
             'url': data['url'],
             'programs': [data['program']],
             'metadata': {
@@ -860,36 +864,25 @@ def update_profile():
     try:
         user_email = get_jwt_identity()
         data = request.json
-        print("-------user email--------")
-        print(user_email)
-        print(data)
         # Verify current password if trying to change password
         if data.get('newPassword'):
             user = db.verify_user({
                 'email': user_email,
                 'password': data['currentPassword']
             })
-            print("------user-------")
-            print(user)
             if 'error' in user:
                 return jsonify({'error': 'Current password is incorrect'}), 400
             
             # Update password
             data['password'] = generate_password_hash(data['newPassword'])
         
-        print("-----------data-------")
-        print(data)
         # Remove sensitive fields from update data
         update_data = {
             'email': data.get('email'),
             'password': data.get('password')  # Only included if password was changed
         }
         update_data = {k: v for k, v in update_data.items() if v is not None}
-        print("-------------update data--------")
-        print(update_data)
         result = db.update_user(user_email, update_data)
-        print("------------result----------")
-        print(result)
         if result.get('error'):
             return jsonify({'error': result['error']}), 400
             
@@ -904,7 +897,51 @@ def update_profile():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
+@app.route('/api/analytics', methods=['GET'])
+@jwt_required()
+def get_analytics():
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        # Get total users count
+        total_users = db.users.count_documents({})
+        
+        # Get premium users count
+        premium_users = db.users.count_documents({'is_premium': True})
+        
+        # Calculate premium percentage
+        premium_percentage = round((premium_users / total_users) * 100 if total_users > 0 else 0, 1)
+        
+        # Get total universities
+        total_universities = db.universities.count_documents({})
+        
+        # Calculate total revenue
+        total_revenue = get_total_revenue(db)
+        
+        # Get growth data
+        monthly_growth = get_monthly_growth(db)
+        
+        # Get activity data
+        user_activity = get_user_activity(db)
+        
+        return jsonify({
+            'totalUsers': total_users,
+            'premiumUsers': premium_users,
+            'totalUniversities': total_universities,
+            'activePremiumPercentage': premium_percentage,
+            'totalRevenue': total_revenue,
+            'monthlyGrowth': monthly_growth,
+            'userActivity': user_activity
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error fetching analytics: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    
 # Error handlers
 @app.errorhandler(500)
 def handle_500_error(e):

@@ -23,6 +23,7 @@ class MongoDB:
         self.user_data = self.db.user_data
         self.custom_columns = self.db.custom_columns
         self.column_data = self.db.column_data
+        self.activity_logs = self.db.activity_logs
         
         # Ensure indexes
         self._ensure_indexes()
@@ -42,6 +43,12 @@ class MongoDB:
             ('user_email', 1),
             ('university_id', 1),
             ('column_id', 1)
+        ])
+        
+        self.activity_logs.create_index([
+            ('timestamp', 1),
+            ('type', 1),
+            ('user_id', 1)
         ])
 
     def create_user(self, data: Dict) -> Dict:
@@ -133,6 +140,7 @@ class MongoDB:
             # Generate a unique ID if not exists
             if not existing:
                 data['id'] = str(ObjectId())
+                data['name'] = data['name']  # Add name field
                 data['created_at'] = datetime.utcnow()
                 data['last_updated'] = datetime.utcnow()
                 
@@ -140,6 +148,7 @@ class MongoDB:
                 if result.inserted_id:
                     return {
                         'id': data['id'],
+                        'name': data['name'],  # Include name in response
                         'url': data['url'],
                         'programs': data['programs'],
                         'metadata': data.get('metadata', {}),
@@ -151,7 +160,8 @@ class MongoDB:
                     '$addToSet': {'programs': {'$each': data['programs']}},
                     '$set': {
                         'last_updated': datetime.utcnow(),
-                        'metadata': data.get('metadata', {})
+                        'metadata': data.get('metadata', {}),
+                        'name': data.get('name', existing.get('name'))  # Update name if provided
                     }
                 }
                 
@@ -162,6 +172,7 @@ class MongoDB:
                 
                 return {
                     'id': existing.get('id', str(existing['_id'])),
+                    'name': data.get('name', existing.get('name')),  # Include updated name
                     'url': data['url'],
                     'programs': list(set(existing['programs'] + data['programs'])),
                     'metadata': data.get('metadata', existing.get('metadata', {})),
@@ -635,3 +646,38 @@ class MongoDB:
         except Exception as e:
             logger.error(f"Error getting column usage: {str(e)}")
             return {'error': str(e)}
+    
+    def log_activity(self, data: dict) -> dict:
+        """Log user activity"""
+        try:
+            activity = {
+                'user_id': data.get('user_id'),
+                'type': data.get('type'),
+                'description': data.get('description'),
+                'metadata': data.get('metadata', {}),
+                'timestamp': datetime.utcnow()
+            }
+            
+            result = self.activity_logs.insert_one(activity)
+            return {'success': True, 'id': str(result.inserted_id)}
+            
+        except Exception as e:
+            logger.error(f"Error logging activity: {str(e)}")
+            return {'error': str(e)}
+    
+    def get_activity_logs(self, filters: dict = None, limit: int = 100) -> list:
+        """Get activity logs with optional filters"""
+        try:
+            query = filters or {}
+            cursor = self.activity_logs.find(
+                query,
+                {'_id': 0}
+            ).sort('timestamp', -1).limit(limit)
+            
+            return list(cursor)
+            
+        except Exception as e:
+            logger.error(f"Error getting activity logs: {str(e)}")
+            return []
+        
+    
