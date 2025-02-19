@@ -21,7 +21,7 @@ load_dotenv()
 app = Flask(__name__)
 
 # CORS configuration
-CORS(app)
+CORS(app, origins=['https://university-tracker-frontend.vercel.app'])
 
 with open('config.json', 'r') as f:
     config = json.load(f)
