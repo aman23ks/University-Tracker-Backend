@@ -1,4 +1,4 @@
-from flask import Flask, make_response, request, jsonify
+from flask import Flask, Response, make_response, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -20,46 +20,77 @@ from services.analytics import get_monthly_growth, get_user_activity, get_total_
 load_dotenv()
 app = Flask(__name__)
 
-CORS(app,
-    resources={
-        r"/*": {  # Handle all routes
-            "origins": ["https://university-tracker-frontend.vercel.app"],
-            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "Accept"],
-            "supports_credentials": True
-        }
-    })
-
-# Global OPTIONS handler for preflight requests
-@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
-@app.route('/<path:path>', methods=['OPTIONS'])
-def handle_options(path):
-    """Handle OPTIONS requests for all routes"""
-    response = make_response()
-    response.headers.add('Access-Control-Allow-Origin', 'https://university-tracker-frontend.vercel.app')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    return response
-
-# Global after request handler
-@app.after_request
-def after_request(response):
-    """Add CORS headers to all responses"""
-    response.headers.add('Access-Control-Allow-Origin', 'https://university-tracker-frontend.vercel.app')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    response.headers.add('Access-Control-Max-Age', '600')  # Cache preflight requests
-    return response
-
-
 with open('config.json', 'r') as f:
     config = json.load(f)
 
 app.config['JWT_SECRET_KEY'] = config['jwt_secret']
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
 jwt = JWTManager(app)
+
+# CORS configuration
+ALLOWED_ORIGIN = "https://university-tracker-frontend.vercel.app"
+
+# Configure CORS with more permissive settings
+CORS(app, 
+    resources={
+        r"/*": {
+            "origins": [ALLOWED_ORIGIN],
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization", "Accept", "Origin"],
+            "expose_headers": ["Content-Type", "Authorization"],
+            "supports_credentials": True,
+            "send_wildcard": False,
+            "max_age": 600
+        }
+    })
+
+def cors_response_decorator(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Handle preflight requests
+        if request.method == "OPTIONS":
+            response = make_response()
+            response = add_cors_headers(response)
+            return response
+
+        # Get the response from the original function
+        response = f(*args, **kwargs)
+        
+        # If response is a tuple (data, status_code)
+        if isinstance(response, tuple):
+            response = make_response(response[0], response[1])
+        # If response is just data
+        elif not isinstance(response, (Response, make_response.__class__)):
+            response = make_response(response)
+        
+        # Add CORS headers
+        response = add_cors_headers(response)
+        return response
+        
+    return decorated_function
+
+def add_cors_headers(response):
+    """Add CORS headers to a response"""
+    response.headers.add('Access-Control-Allow-Origin', ALLOWED_ORIGIN)
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Max-Age', '600')
+    return response
+
+# Global error handler
+@app.errorhandler(Exception)
+def handle_error(error):
+    code = 500
+    if hasattr(error, 'code'):
+        code = error.code
+    
+    response = make_response(jsonify({
+        'error': str(error),
+        'status_code': code
+    }), code)
+    
+    return add_cors_headers(response)
 
 # Initialize services
 db = MongoDB(config['mongo_uri'])
@@ -90,6 +121,7 @@ def serialize_mongo(obj):
 
 # Authentication routes
 @app.route('/api/auth/register', methods=['POST'])
+@cors_response_decorator
 def register():
     data = request.json
     result = db.create_user(data)
@@ -101,6 +133,7 @@ def register():
     return jsonify({'token': access_token, 'user': user}), 201
 
 @app.route('/api/auth/login', methods=['POST'])
+@cors_response_decorator
 def login():
     try:
         data = request.json
@@ -128,6 +161,7 @@ def login():
 
 @app.route('/auth/verify', methods=['GET'])
 @jwt_required()
+@cors_response_decorator
 def verify_token():
     try:
         current_user = get_jwt_identity()
@@ -150,11 +184,13 @@ def verify_token():
 # University routes
 @app.route('/api/universities', methods=['GET'])
 @jwt_required()
+@cors_response_decorator
 def get_universities():
     return jsonify(db.get_universities())
 
 @app.route('/api/universities', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 async def add_university():
     user_email = get_jwt_identity()
     user = db.get_user(user_email)
@@ -240,6 +276,7 @@ async def add_university():
 
 @app.route('/api/universities/<string:id>', methods=['DELETE'])
 @jwt_required()
+@cors_response_decorator
 def delete_university(id):
     user_email = get_jwt_identity()
     user = db.get_user(user_email)
@@ -275,6 +312,7 @@ def delete_university(id):
 
 @app.route('/api/rag', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def query_rag():
     try:
         data = request.json
@@ -315,6 +353,7 @@ def query_rag():
         
 @app.route('/api/users', methods=['GET'])
 @jwt_required()
+@cors_response_decorator
 def get_users():
     try:
         # Get current user
@@ -354,6 +393,7 @@ def get_users():
 
 @app.route('/api/universities/find', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def find_university():
     try:
         data = request.json
@@ -378,6 +418,7 @@ def find_university():
 
 @app.route('/api/universities/details', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def get_universities_details():
     try:
         data = request.json
@@ -409,6 +450,7 @@ def get_universities_details():
 
 @app.route('/api/users/universities/add', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def add_university_to_user():
     try:
         current_user = get_jwt_identity()
@@ -502,6 +544,7 @@ def add_university_to_user():
 
 @app.route('/api/users/universities/remove', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def remove_university_from_user():
     try:
         current_user = get_jwt_identity()
@@ -535,6 +578,7 @@ def remove_university_from_user():
     
 @app.route('/api/users/update', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def update_user():
     try:
         current_user = get_jwt_identity()
@@ -566,6 +610,7 @@ def update_user():
 
 @app.route('/api/users/universities/update', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def update_user_universities():
     try:
         current_user = get_jwt_identity()
@@ -592,6 +637,7 @@ def update_user_universities():
 # Add these routes to app.py
 @app.route('/api/columns', methods=['GET'])
 @jwt_required()
+@cors_response_decorator
 def get_columns():
     try:
         current_user = get_jwt_identity()
@@ -607,6 +653,7 @@ def get_columns():
 
 @app.route('/api/columns', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def create_column():
     try:
         current_user = get_jwt_identity()
@@ -637,6 +684,7 @@ def create_column():
 
 @app.route('/api/columns/data', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def save_column_data():
     try:
         current_user = get_jwt_identity()
@@ -665,6 +713,7 @@ def save_column_data():
 
 @app.route('/api/columns/data/batch', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def get_column_data():
     try:
         current_user = get_jwt_identity()
@@ -683,6 +732,7 @@ def get_column_data():
 # Add this route to app.py
 @app.route('/api/columns/<string:column_id>', methods=['DELETE'])
 @jwt_required()
+@cors_response_decorator
 def delete_column(column_id):
     try:
         current_user = get_jwt_identity()
@@ -710,6 +760,7 @@ def delete_column(column_id):
 
 @app.route('/api/subscription/create-order', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def create_subscription_order():
     try:
         user_email = get_jwt_identity()
@@ -730,6 +781,7 @@ def create_subscription_order():
 
 @app.route('/api/subscription/verify', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def verify_subscription():
     try:
         user_email = get_jwt_identity()
@@ -781,6 +833,7 @@ def verify_subscription():
 # Add this function to your app.py
 @app.route('/api/subscription/status', methods=['GET'])
 @jwt_required()
+@cors_response_decorator
 def check_subscription_status():
     try:
         user_email = get_jwt_identity()
@@ -827,6 +880,7 @@ def check_subscription_status():
     
 @app.route('/api/subscription/cancel', methods=['POST'])
 @jwt_required()
+@cors_response_decorator
 def cancel_subscription():
     try:
         user_email = get_jwt_identity()
@@ -848,6 +902,7 @@ def cancel_subscription():
 
 @app.route('/api/users/profile', methods=['GET'])
 @jwt_required()
+@cors_response_decorator
 def get_profile():
     try:
         user_email = get_jwt_identity()
@@ -871,6 +926,7 @@ def get_profile():
 
 @app.route('/api/users/profile', methods=['PUT'])
 @jwt_required()
+@cors_response_decorator
 def update_profile():
     try:
         user_email = get_jwt_identity()
@@ -910,6 +966,7 @@ def update_profile():
 
 @app.route('/api/analytics', methods=['GET'])
 @jwt_required()
+@cors_response_decorator
 def get_analytics():
     try:
         current_user = get_jwt_identity()
