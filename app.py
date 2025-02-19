@@ -20,8 +20,18 @@ from services.analytics import get_monthly_growth, get_user_activity, get_total_
 load_dotenv()
 app = Flask(__name__)
 
-# CORS configuration
-CORS(app, origins=['https://university-tracker-frontend.vercel.app'])
+CORS(app, 
+     resources={
+         r"/*": {
+             "origins": ["https://university-tracker-frontend.vercel.app"],
+             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+             "allow_headers": ["Content-Type", "Authorization"],
+             "expose_headers": ["Authorization"],
+             "supports_credentials": True,
+             "max_age": 600
+         }
+     }
+)
 
 with open('config.json', 'r') as f:
     config = json.load(f)
