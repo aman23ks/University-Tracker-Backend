@@ -18,14 +18,13 @@
           },
           {
             "key": "Access-Control-Allow-Headers",
-            "value": "Content-Type,Authorization,Accept"
-          },
-          {
-            "key": "Access-Control-Max-Age",
-            "value": "600"
+            "value": "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization"
           }
         ]
       }
+    ],
+    "rewrites": [
+      { "source": "/(.*)", "destination": "app.py" }
     ],
     "routes": [
       {
