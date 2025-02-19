@@ -30,36 +30,23 @@ jwt = JWTManager(app)
 CORS(app, 
     resources={
         r"/*": {
-            "origins": ["https://university-tracker-frontend.vercel.app"],
+            "origins": "https://university-tracker-frontend.vercel.app",
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "Accept", "Origin"],
-            "expose_headers": ["Content-Type", "Authorization"],
-            "supports_credentials": True,
-            "max_age": 600
+            "allow_headers": ["Content-Type", "Authorization"],
+            "supports_credentials": True
         }
     })
 
-# Handle preflight requests
+# Single preflight handler
 @app.before_request
-def before_request():
+def handle_preflight():
     if request.method == "OPTIONS":
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", "https://university-tracker-frontend.vercel.app")
-        response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin")
-        response.headers.add("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-        response.headers.add("Access-Control-Allow-Credentials", "true")
-        response.headers.add("Access-Control-Max-Age", "600")
-        return response
-
-# Add CORS headers to all responses
-@app.after_request
-def after_request(response):
-    response.headers.add("Access-Control-Allow-Origin", "https://university-tracker-frontend.vercel.app")
-    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin")
-    response.headers.add("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-    response.headers.add("Access-Control-Allow-Credentials", "true")
-    response.headers.add("Access-Control-Max-Age", "600")
-    return response
+        resp = app.make_default_options_response()
+        resp.headers['Access-Control-Allow-Origin'] = 'https://university-tracker-frontend.vercel.app'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+        resp.headers['Access-Control-Allow-Credentials'] = 'true'
+        return resp
 
 # Initialize services
 db = MongoDB(config['mongo_uri'])
