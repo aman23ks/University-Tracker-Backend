@@ -20,74 +20,39 @@ from services.analytics import get_monthly_growth, get_user_activity, get_total_
 load_dotenv()
 app = Flask(__name__)
 
-ALLOWED_ORIGINS = [
-    'https://university-tracker-frontend.vercel.app',
-    'http://localhost:3000'
-]
-
 CORS(app,
     resources={
-        r"/*": {
-            "origins": ALLOWED_ORIGINS,
+        r"/*": {  # Handle all routes
+            "origins": ["https://university-tracker-frontend.vercel.app"],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": [
-                "Content-Type",
-                "Authorization",
-                "Accept",
-                "Origin",
-                "Access-Control-Allow-Headers",
-                "Access-Control-Request-Method",
-                "Access-Control-Request-Headers"
-            ],
-            "expose_headers": [
-                "Authorization",
-                "Content-Type",
-                "Access-Control-Allow-Origin",
-                "Access-Control-Allow-Credentials"
-            ],
-            "supports_credentials": True,
-            "max_age": 600,
-            "vary_header": True
+            "allow_headers": ["Content-Type", "Authorization", "Accept"],
+            "supports_credentials": True
         }
-    }
-)
+    })
 
-# CORS middleware for handling preflight requests
-@app.after_request
-def after_request(response):
-    origin = request.headers.get('Origin')
-    
-    if origin in ALLOWED_ORIGINS:
-        # Set CORS headers for the response
-        response.headers.add('Access-Control-Allow-Origin', origin)
-        response.headers.add('Access-Control-Allow-Credentials', 'true')
-        response.headers.add('Access-Control-Allow-Headers', 
-            'Content-Type, Authorization, Accept, Origin')
-        response.headers.add('Access-Control-Allow-Methods',
-            'GET, POST, PUT, DELETE, OPTIONS')
-        response.headers.add('Access-Control-Max-Age', '600')
-        response.headers.add('Vary', 'Origin')
-    
+# Global OPTIONS handler for preflight requests
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    """Handle OPTIONS requests for all routes"""
+    response = make_response()
+    response.headers.add('Access-Control-Allow-Origin', 'https://university-tracker-frontend.vercel.app')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
     return response
 
-# Preflight request handler
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        response = make_response()
-        origin = request.headers.get('Origin')
-        
-        if origin in ALLOWED_ORIGINS:
-            response.headers.add('Access-Control-Allow-Origin', origin)
-            response.headers.add('Access-Control-Allow-Credentials', 'true')
-            response.headers.add('Access-Control-Allow-Headers',
-                'Content-Type, Authorization, Accept, Origin')
-            response.headers.add('Access-Control-Allow-Methods',
-                'GET, POST, PUT, DELETE, OPTIONS')
-            response.headers.add('Access-Control-Max-Age', '600')
-            response.headers.add('Vary', 'Origin')
-            
-        return response
+# Global after request handler
+@app.after_request
+def after_request(response):
+    """Add CORS headers to all responses"""
+    response.headers.add('Access-Control-Allow-Origin', 'https://university-tracker-frontend.vercel.app')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Max-Age', '600')  # Cache preflight requests
+    return response
+
 
 with open('config.json', 'r') as f:
     config = json.load(f)
