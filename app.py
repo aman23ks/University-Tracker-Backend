@@ -21,28 +21,8 @@ load_dotenv()
 app = Flask(__name__)
 
 # CORS configuration
-CORS(app, resources={
-    r"/*": {
-        "origins": ["http://localhost:3000"],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True,
-        "expose_headers": ["Authorization"]
-    }
-})
+CORS(app)
 
-# Pre-flight request handler
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", "http://localhost:3000")
-        response.headers.add("Access-Control-Allow-Headers", "*")
-        response.headers.add("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-        response.headers.add("Access-Control-Allow-Credentials", "true")
-        return response
-
-# Load configuration
 with open('config.json', 'r') as f:
     config = json.load(f)
 
