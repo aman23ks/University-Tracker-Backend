@@ -1,14 +1,22 @@
 {
+    "version": 2,
     "builds": [
       {
         "src": "app.py",
         "use": "@vercel/python"
       }
     ],
-    "rewrites": [
+    "routes": [
       {
-        "source": "/(.*)",
-        "destination": "app.py"
+        "src": "/(.*)",
+        "dest": "app.py",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "headers": {
+          "Access-Control-Allow-Origin": "https://university-tracker-frontend.vercel.app",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+          "Access-Control-Allow-Credentials": "true"
+        }
       }
     ]
   }
