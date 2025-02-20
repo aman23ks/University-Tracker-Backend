@@ -99,15 +99,23 @@ def register():
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     try:
-        # Force content type to JSON if not set
-        if not request.is_json:
-            try:
-                data = json.loads(request.data)
-            except:
-                return jsonify({'error': 'Invalid JSON data'}), 400
-        else:
-            data = request.json
+        # Log raw request data for debugging
+        print("Raw request data:", request.get_data())
+        print("Content-Type:", request.headers.get('Content-Type'))
+
+        # Try to parse JSON data carefully
+        try:
+            if request.is_json:
+                data = request.get_json()
+            else:
+                data = json.loads(request.get_data().decode('utf-8'))
+        except json.JSONDecodeError as e:
+            print("JSON decode error:", str(e))
+            return jsonify({'error': 'Invalid JSON format'}), 400
             
+        if not data or 'email' not in data or 'password' not in data:
+            return jsonify({'error': 'Email and password are required'}), 400
+
         print(f"Login attempt for: {data.get('email')}")
         
         user = db.verify_user(data)
