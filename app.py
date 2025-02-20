@@ -65,19 +65,19 @@ def get_services():
 # Get service instances
 db, rag, payment, crawler = get_services()
 
-# Add error handlers
-@app.errorhandler(504)
-def gateway_timeout_error(error):
-    return jsonify({
-        'error': 'Gateway Timeout',
-        'message': 'The server took too long to respond. Please try again.'
-    }), 504
+# Add this after your app initialization but before routes
+@app.before_request
+def handle_content_type():
+    if request.method == 'POST':
+        if not request.is_json:
+            request.environ['CONTENT_TYPE'] = 'application/json'
 
 @app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
-    response.headers['Access-Control-Allow-Methods'] = 'GET,PUT,POST,DELETE,OPTIONS'
+def handle_response(response):
+    if request.method == 'OPTIONS':
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
     return response
 
 def serialize_mongo(obj):
