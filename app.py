@@ -17,6 +17,7 @@ import json
 from typing import List, Dict
 from dotenv import load_dotenv
 import os
+from flask_cors import CORS
 from services.analytics import get_monthly_growth, get_user_activity, get_total_revenue
 
 load_dotenv()
@@ -24,6 +25,10 @@ app = Flask(__name__)
 
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
+app.config['CORS_HEADERS'] = 'Content-Type'
+
+CORS(app)
+
 jwt = JWTManager(app)
 
 # CORS(app) 
