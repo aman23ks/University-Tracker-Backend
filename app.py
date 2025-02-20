@@ -26,8 +26,20 @@ app = Flask(__name__)
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
 app.config['CORS_HEADERS'] = 'Content-Type'
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True
+    }
+})
 
-CORS(app)
+# Add this before request handler
+@app.before_request
+def handle_content_type():
+    if request.method == 'POST':
+        request.environ['CONTENT_TYPE'] = 'application/json'
 
 jwt = JWTManager(app)
 
