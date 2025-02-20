@@ -22,32 +22,32 @@ from services.analytics import get_monthly_growth, get_user_activity, get_total_
 load_dotenv()
 app = Flask(__name__)
 
-app.config['JWT_SECRET_KEY'] = os.getenv['JWT_SECRET']
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
 jwt = JWTManager(app)
 
 # CORS(app) 
     
-db = MongoDB(os.getenv['MONGO_URI'])
+db = MongoDB(os.getenv('MONGO_URI'))
 
 # Initialize RAG with all required parameters
 rag = RAGRetrieval(
-    openai_api_key=os.getenv['OPENAI_API_KEY'],
-    pinecone_api_key=os.getenv['PINECONE_API_KEY'],
-    cohere_api_key=os.getenv['COHERE_API_KEY'],
-    index_name=os.getenv['INDEX_NAME']
+    openai_api_key=os.getenv('OPENAI_API_KEY'),
+    pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+    cohere_api_key=os.getenv('COHERE_API_KEY'),
+    index_name=os.getenv('INDEX_NAME')
 )
 
 payment = PaymentService(
-    key_id=os.getenv['RAZORPAY_KEY_ID'],
-    key_secret=os.getenv['RAZORPAY_KEY_SECRET']
+    key_id=os.getenv('RAZORPAY_KEY_ID'),
+    key_secret=os.getenv('RAZORPAY_KEY_SECRET')
 )
 
 # Initialize crawler with the same parameters
 crawler = HybridCrawler(
-    openai_api_key=os.getenv['OPENAI_API_KEY'],
-    pinecone_api_key=os.getenv['PINECONE_API_KEY'],
-    index_name=os.getenv['INDEX_NAME']
+    openai_api_key=os.getenv('OPENAI_API_KEY'),
+    pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+    index_name=os.getenv('INDEX_NAME')
 )
 
 def serialize_mongo(obj):
