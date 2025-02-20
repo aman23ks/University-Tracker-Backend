@@ -1,6 +1,5 @@
 from functools import wraps
 from flask import Flask, Response, make_response, request, jsonify
-from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import timedelta
@@ -28,7 +27,7 @@ app.config['JWT_SECRET_KEY'] = config['jwt_secret']
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
 jwt = JWTManager(app)
 
-CORS(app) 
+# CORS(app) 
     
 db = MongoDB(config['mongo_uri'])
 
@@ -936,4 +935,4 @@ def handle_404_error(e):
     }), 404
 
 if __name__ == '__main__':
-    app.run()
+    app.run(debug=True, port=5000)
