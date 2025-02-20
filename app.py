@@ -1,4 +1,4 @@
-from functools import wraps
+from functools import wraps, lru_cache
 from flask import Flask, Response, make_response, request, jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -23,9 +23,12 @@ from services.analytics import get_monthly_growth, get_user_activity, get_total_
 load_dotenv()
 app = Flask(__name__)
 
+# Configure app
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
 app.config['CORS_HEADERS'] = 'Content-Type'
+
+# Configure CORS
 CORS(app, resources={
     r"/*": {
         "origins": "*",
@@ -35,37 +38,47 @@ CORS(app, resources={
     }
 })
 
-# Add this before request handler
-@app.before_request
-def handle_content_type():
-    if request.method == 'POST':
-        request.environ['CONTENT_TYPE'] = 'application/json'
-
+# Initialize JWT
 jwt = JWTManager(app)
 
-# CORS(app) 
-    
-db = MongoDB(os.getenv('MONGO_URI'))
+# Lazy service initialization
+@lru_cache()
+def get_services():
+    db = MongoDB(os.getenv('MONGO_URI'))
+    rag = RAGRetrieval(
+        openai_api_key=os.getenv('OPENAI_API_KEY'),
+        pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+        cohere_api_key=os.getenv('COHERE_API_KEY'),
+        index_name=os.getenv('INDEX_NAME')
+    )
+    payment = PaymentService(
+        key_id=os.getenv('RAZORPAY_KEY_ID'),
+        key_secret=os.getenv('RAZORPAY_KEY_SECRET')
+    )
+    crawler = HybridCrawler(
+        openai_api_key=os.getenv('OPENAI_API_KEY'),
+        pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+        index_name=os.getenv('INDEX_NAME')
+    )
+    return db, rag, payment, crawler
 
-# Initialize RAG with all required parameters
-rag = RAGRetrieval(
-    openai_api_key=os.getenv('OPENAI_API_KEY'),
-    pinecone_api_key=os.getenv('PINECONE_API_KEY'),
-    cohere_api_key=os.getenv('COHERE_API_KEY'),
-    index_name=os.getenv('INDEX_NAME')
-)
+# Get service instances
+db, rag, payment, crawler = get_services()
 
-payment = PaymentService(
-    key_id=os.getenv('RAZORPAY_KEY_ID'),
-    key_secret=os.getenv('RAZORPAY_KEY_SECRET')
-)
+# Add error handlers
+@app.errorhandler(504)
+def gateway_timeout_error(error):
+    return jsonify({
+        'error': 'Gateway Timeout',
+        'message': 'The server took too long to respond. Please try again.'
+    }), 504
 
-# Initialize crawler with the same parameters
-crawler = HybridCrawler(
-    openai_api_key=os.getenv('OPENAI_API_KEY'),
-    pinecone_api_key=os.getenv('PINECONE_API_KEY'),
-    index_name=os.getenv('INDEX_NAME')
-)
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,PUT,POST,DELETE,OPTIONS'
+    return response
 
 def serialize_mongo(obj):
     """Convert MongoDB objects to JSON serializable format"""
