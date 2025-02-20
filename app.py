@@ -15,40 +15,39 @@ from datetime import datetime, timezone
 from bson import json_util, ObjectId
 import json
 from typing import List, Dict
+from dotenv import load_dotenv
+import os
 from services.analytics import get_monthly_growth, get_user_activity, get_total_revenue
 
 load_dotenv()
 app = Flask(__name__)
 
-with open('config.json', 'r') as f:
-    config = json.load(f)
-
-app.config['JWT_SECRET_KEY'] = config['jwt_secret']
+app.config['JWT_SECRET_KEY'] = os.getenv['JWT_SECRET']
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
 jwt = JWTManager(app)
 
 # CORS(app) 
     
-db = MongoDB(config['mongo_uri'])
+db = MongoDB(os.getenv['MONGO_URI'])
 
 # Initialize RAG with all required parameters
 rag = RAGRetrieval(
-    openai_api_key=config['openai_api_key'],
-    pinecone_api_key=config['pinecone_api_key'],
-    cohere_api_key=config['cohere_api_key'],
-    index_name=config['index_name']
+    openai_api_key=os.getenv['OPENAI_API_KEY'],
+    pinecone_api_key=os.getenv['PINECONE_API_KEY'],
+    cohere_api_key=os.getenv['COHERE_API_KEY'],
+    index_name=os.getenv['INDEX_NAME']
 )
 
 payment = PaymentService(
-    key_id=config['razorpay_key_id'],
-    key_secret=config['razorpay_key_secret']
+    key_id=os.getenv['RAZORPAY_KEY_ID'],
+    key_secret=os.getenv['RAZORPAY_KEY_SECRET']
 )
 
 # Initialize crawler with the same parameters
 crawler = HybridCrawler(
-    openai_api_key=config['openai_api_key'],
-    pinecone_api_key=config['pinecone_api_key'],
-    index_name=config['index_name']
+    openai_api_key=os.getenv['OPENAI_API_KEY'],
+    pinecone_api_key=os.getenv['PINECONE_API_KEY'],
+    index_name=os.getenv['INDEX_NAME']
 )
 
 def serialize_mongo(obj):
