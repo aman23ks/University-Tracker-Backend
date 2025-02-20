@@ -99,42 +99,24 @@ def register():
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     try:
-        print("Raw request data:", request.get_data())
-        print("Content-Type:", request.headers.get('Content-Type'))
-
-        try:
-            if request.is_json:
-                data = request.get_json()
-            else:
-                data = json.loads(request.get_data().decode('utf-8'))
-        except json.JSONDecodeError as e:
-            print("JSON decode error:", str(e))
-            return jsonify({'error': 'Invalid JSON format'}), 400
-            
-        if not data or 'email' not in data or 'password' not in data:
-            return jsonify({'error': 'Email and password are required'}), 400
-
+        data = request.json
         print(f"Login attempt for: {data.get('email')}")
         
         user = db.verify_user(data)
-        print("Verification result:", user)  # Add this log
-        
         if 'error' in user:
             return jsonify(user), 401
             
         access_token = create_access_token(identity=data['email'])
-        response_data = {
+        return jsonify({
             'token': access_token,
             'user': {
                 'email': user['email'],
-                'is_admin': user.get('is_admin', False),
-                'is_premium': user.get('is_premium', False),
-                'selected_universities': user.get('selected_universities', []),
+                'is_admin': user['is_admin'],
+                'is_premium': user['is_premium'],
+                'selected_universities': user['selected_universities'],
                 'subscription': user.get('subscription', {'status': 'free'})
             }
-        }
-        print("Sending response:", response_data)  # Add this log
-        return jsonify(response_data)
+        })
         
     except Exception as e:
         print(f"Login error: {str(e)}")
