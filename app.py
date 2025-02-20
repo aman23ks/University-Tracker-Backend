@@ -99,11 +99,9 @@ def register():
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     try:
-        # Log raw request data for debugging
         print("Raw request data:", request.get_data())
         print("Content-Type:", request.headers.get('Content-Type'))
 
-        # Try to parse JSON data carefully
         try:
             if request.is_json:
                 data = request.get_json()
@@ -119,20 +117,24 @@ def login():
         print(f"Login attempt for: {data.get('email')}")
         
         user = db.verify_user(data)
+        print("Verification result:", user)  # Add this log
+        
         if 'error' in user:
             return jsonify(user), 401
             
         access_token = create_access_token(identity=data['email'])
-        return jsonify({
+        response_data = {
             'token': access_token,
             'user': {
                 'email': user['email'],
-                'is_admin': user['is_admin'],
-                'is_premium': user['is_premium'],
-                'selected_universities': user['selected_universities'],
+                'is_admin': user.get('is_admin', False),
+                'is_premium': user.get('is_premium', False),
+                'selected_universities': user.get('selected_universities', []),
                 'subscription': user.get('subscription', {'status': 'free'})
             }
-        })
+        }
+        print("Sending response:", response_data)  # Add this log
+        return jsonify(response_data)
         
     except Exception as e:
         print(f"Login error: {str(e)}")
