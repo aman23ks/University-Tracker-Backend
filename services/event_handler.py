@@ -1,18 +1,25 @@
-import redis
 import json
 from datetime import datetime
 import os
+from services.redis_fix import get_redis_connection
 
-# Configure Redis connection based on environment
-redis_host = os.getenv('REDISHOST', os.getenv('REDIS_HOST', 'localhost'))
-redis_port = int(os.getenv('REDISPORT', os.getenv('REDIS_PORT', 6379)))
-
-redis_client = redis.Redis(
-    host=redis_host,
-    port=redis_port,
-    db=0,
-    decode_responses=True
-)
+# Initialize Redis client
+try:
+    redis_client = get_redis_connection()
+    print("Redis connection established")
+except Exception as e:
+    print(f"Warning: Could not connect to Redis: {e}")
+    # Create a dummy client for fallback
+    class DummyRedis:
+        def publish(self, *args, **kwargs): 
+            print(f"Would publish to Redis: {args}, {kwargs}")
+        def set(self, *args, **kwargs): 
+            print(f"Would set in Redis: {args}, {kwargs}")
+        def hset(self, *args, **kwargs): 
+            print(f"Would hset in Redis: {args}, {kwargs}")
+        def expire(self, *args, **kwargs): pass
+        def delete(self, *args, **kwargs): pass
+    redis_client = DummyRedis()
 
 def publish_status_update(university_id: str, status: str, data: dict = None):
     """Publish university status update to Redis"""

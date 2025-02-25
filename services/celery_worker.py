@@ -9,6 +9,7 @@ from services.hybrid_crawler import HybridCrawler
 from services.database import MongoDB
 from services.rag_retrieval import RAGRetrieval
 from functools import wraps
+from services.redis_fix import get_redis_connection
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,13 +20,22 @@ redis_host = os.getenv('REDISHOST', os.getenv('REDIS_HOST', 'localhost'))
 redis_port = int(os.getenv('REDISPORT', os.getenv('REDIS_PORT', 6379)))
 redis_url = os.getenv('REDIS_URL', f'redis://{redis_host}:{redis_port}/0')
 
-# Initialize Redis client for Celery worker
-redis_client = redis.Redis(
-    host=redis_host,
-    port=redis_port,
-    db=0,
-    decode_responses=True
-)
+try:
+    redis_client = get_redis_connection()
+    print("Redis connection established for Celery worker")
+except Exception as e:
+    logger.error(f"Redis connection failed: {e}")
+    # Fallback to dummy client that doesn't break the app
+    class DummyRedis:
+        def get(self, *args): return None
+        def set(self, *args, **kwargs): pass
+        def hset(self, *args, **kwargs): pass
+        def hgetall(self, *args): return {}
+        def publish(self, *args, **kwargs): pass
+        def delete(self, *args): pass
+        def expire(self, *args, **kwargs): pass
+    redis_client = DummyRedis()
+    logger.warning("Using dummy Redis client as fallback")
 
 # Initialize Celery with the Redis URL
 celery = Celery(

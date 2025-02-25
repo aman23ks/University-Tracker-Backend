@@ -30,6 +30,7 @@ from services.socket_service import socketio
 from engineio.payload import Payload
 import threading
 from services.event_handler import redis_client, publish_status_update
+from services.redis_fix import get_redis_connection
 
 
 load_dotenv()
@@ -59,12 +60,27 @@ redis_port = int(os.getenv('REDISPORT', os.getenv('REDIS_PORT', 6379)))
 redis_url = os.getenv('REDIS_URL', f'redis://{redis_host}:{redis_port}/0')
 
 # Initialize Redis client for the app
-redis_client = redis.Redis(
-    host=redis_host,
-    port=redis_port,
-    db=0,
-    decode_responses=True
-)
+try:
+    redis_client = get_redis_connection()
+    print("Redis connection established successfully")
+except Exception as e:
+    app.logger.error(f"Redis connection failed: {e}")
+    # Fallback to dummy client that doesn't break the app
+    class DummyRedis:
+        def get(self, *args): return None
+        def set(self, *args, **kwargs): pass
+        def hset(self, *args, **kwargs): pass
+        def hgetall(self, *args): return {}
+        def publish(self, *args, **kwargs): pass
+        def delete(self, *args): pass
+        def expire(self, *args, **kwargs): pass
+        def pubsub(self): 
+            dummy = DummyRedis()
+            dummy.subscribe = lambda *args: None
+            dummy.listen = lambda: []
+            return dummy
+    redis_client = DummyRedis()
+    print("Using dummy Redis client as fallback")
 
 # Lazy service initialization
 @lru_cache()
