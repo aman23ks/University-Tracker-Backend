@@ -4,8 +4,8 @@ buildCommand = "pip install -r requirements.txt"
 
 [deploy]
 startCommand = "gunicorn --worker-class eventlet -w 1 app:app"
-healthcheckPath = "/api/healthcheck"
-healthcheckTimeout = 300
+healthcheckPath = "/"
+healthcheckTimeout = 60
 restartPolicy = "on-failure"  # Changed from restartPolicyType
 maxRestarts = 10  # Changed from restartPolicyMaxRetries
 

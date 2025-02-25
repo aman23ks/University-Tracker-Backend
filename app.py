@@ -1310,43 +1310,15 @@ def get_batch_status():
 def healthcheck():
     """Health check endpoint for deployment monitoring"""
     try:
-        # Test database connection
-        db_status = "error"
-        try:
-            # Try to get a user count as a basic DB test
-            user_count = db.db.users.count_documents({})
-            db_status = "ok"
-        except Exception as db_err:
-            db_status = f"error: {str(db_err)}"
-        
-        # Test Redis connection
-        redis_status = "error"
-        try:
-            test_key = f"healthcheck_{datetime.utcnow().timestamp()}"
-            redis_client.set(test_key, "test_value")
-            redis_value = redis_client.get(test_key)
-            redis_client.delete(test_key)
-            redis_status = "ok" if redis_value == "test_value" else "error: values don't match"
-        except Exception as redis_err:
-            redis_status = f"error: {str(redis_err)}"
-        
-        # Return status summary
         return jsonify({
             'status': 'ok',
-            'timestamp': datetime.utcnow().isoformat(),
-            'environment': os.getenv('FLASK_ENV', 'production'),
-            'services': {
-                'web': 'ok',
-                'database': db_status,
-                'redis': redis_status
-            }
+            'timestamp': datetime.utcnow().isoformat()
         })
     except Exception as e:
         app.logger.error(f"Healthcheck failed: {str(e)}")
         return jsonify({
             'status': 'error',
-            'message': str(e),
-            'timestamp': datetime.utcnow().isoformat()
+            'message': str(e)
         }), 500
 
 @app.errorhandler(500)
