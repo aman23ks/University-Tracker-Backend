@@ -3,7 +3,7 @@ builder = "nixpacks"
 buildCommand = "pip install -r requirements.txt"
 
 [deploy]
-startCommand = "gunicorn --worker-class eventlet -w 1 app:app"
+startCommand = "celery -A services.celery_worker worker --loglevel=info"
 restartPolicy = "on-failure"
 maxRestarts = 10
 
