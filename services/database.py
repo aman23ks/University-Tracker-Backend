@@ -15,37 +15,37 @@ logging.basicConfig(
 
 class MongoDB:
     def __init__(self, uri: str = 'mongodb://localhost:27017/'):
-        self.client = MongoClient(uri)
-        self.db = self.client['university_tracker']
-        # Initialize collections as class attributes
-        self.users = self.db.users
-        self.universities = self.db.universities
-        self.user_data = self.db.user_data
-        self.custom_columns = self.db.custom_columns
-        self.column_data = self.db.column_data
-        self.activity_logs = self.db.activity_logs
-        
-        # Ensure indexes
-        self._ensure_indexes()
+        """Fork-safe initialization"""
+        self.uri = uri
+        self.client = None
+        self.db = None
+        self.connect()
+
+    def connect(self):
+        """Initialize connection"""
+        if not self.client:
+            self.client = MongoClient(self.uri)
+            self.db = self.client['university_tracker']
+            self._ensure_indexes()
 
     def _ensure_indexes(self):
         # Existing indexes
-        self.users.create_index('email', unique=True)
-        self.universities.create_index('url', unique=True)
-        self.user_data.create_index([('user_email', 1), ('university_url', 1)])
+        self.db.users.create_index('email', unique=True)
+        self.db.universities.create_index('url', unique=True)
+        self.db.user_data.create_index([('user_email', 1), ('university_url', 1)])
 
         # Add new indexes for custom columns
-        self.custom_columns.create_index([
+        self.db.custom_columns.create_index([
             ('created_by', 1),
             ('name', 1)
         ])
-        self.column_data.create_index([
+        self.db.column_data.create_index([
             ('user_email', 1),
             ('university_id', 1),
             ('column_id', 1)
         ])
         
-        self.activity_logs.create_index([
+        self.db.activity_logs.create_index([
             ('timestamp', 1),
             ('type', 1),
             ('user_id', 1)
@@ -53,7 +53,7 @@ class MongoDB:
 
     def create_user(self, data: Dict) -> Dict:
         try:
-            if self.users.find_one({'email': data['email']}):  # Changed from users
+            if self.db.users.find_one({'email': data['email']}):  # Changed from users
                 return {'error': 'Email already exists'}
             
             user = {
@@ -71,7 +71,7 @@ class MongoDB:
                 }
             }
             
-            result = self.users.insert_one(user)  # Changed from users
+            result = self.db.users.insert_one(user)  # Changed from users
             user_without_password = {k: v for k, v in user.items() if k != 'password'}
             return user_without_password
             
@@ -81,14 +81,14 @@ class MongoDB:
 
     def verify_user(self, data: Dict) -> Dict:
         try:
-            user = self.users.find_one({'email': data['email']})  # Changed
+            user = self.db.users.find_one({'email': data['email']})  # Changed
             if not user:
                 return {'error': 'User not found'}
             
             if not check_password_hash(user['password'], data['password']):
                 return {'error': 'Invalid password'}
             
-            self.users.update_one(  # Changed
+            self.db.users.update_one(  # Changed
                 {'email': data['email']},
                 {
                     '$set': {'last_login': datetime.utcnow()},
@@ -110,7 +110,7 @@ class MongoDB:
 
     def get_user(self, email: str) -> Optional[Dict]:
         try:
-            user = self.users.find_one(  # Changed
+            user = self.db.users.find_one(  # Changed
                 {'email': email},
                 {'password': 0}  # Exclude password
             )
@@ -123,10 +123,16 @@ class MongoDB:
 
     def get_universities(self, query: Dict = None) -> List[Dict]:
         try:
-            universities = list(self.universities.find(  # Changed
-                query or {},
-                {'_id': 0}
-            ))
+            universities = list(self.db.universities.find(query or {}))
+            for uni in universities:
+                # Ensure status exists
+                if 'status' not in uni:
+                    uni['status'] = 'pending'
+                # Convert ObjectId to string
+                uni['_id'] = str(uni['_id'])
+                # Ensure ID exists
+                if 'id' not in uni:
+                    uni['id'] = uni['_id']
             return universities
         except Exception as e:
             logger.error(f"Error getting universities: {str(e)}")
@@ -135,7 +141,7 @@ class MongoDB:
     def add_university(self, data: Dict) -> Dict:
         try:
             # Check if university already exists
-            existing = self.universities.find_one({'url': data['url']})
+            existing = self.db.universities.find_one({'url': data['url']})
             
             # Generate a unique ID if not exists
             if not existing:
@@ -144,7 +150,7 @@ class MongoDB:
                 data['created_at'] = datetime.utcnow()
                 data['last_updated'] = datetime.utcnow()
                 
-                result = self.universities.insert_one(data)
+                result = self.db.universities.insert_one(data)
                 if result.inserted_id:
                     return {
                         'id': data['id'],
@@ -165,7 +171,7 @@ class MongoDB:
                     }
                 }
                 
-                self.universities.update_one(
+                self.db.universities.update_one(
                     {'url': data['url']},
                     update_data
                 )
@@ -186,7 +192,7 @@ class MongoDB:
 
     def delete_university(self, university_id: str) -> Dict:
         try:
-            result = self.universities.delete_one({'id': university_id})
+            result = self.db.universities.delete_one({'id': university_id})
             if result.deleted_count:
                 return {'success': True}
             return {'error': 'University not found'}
@@ -197,7 +203,7 @@ class MongoDB:
     def get_users(self) -> List[Dict]:
         """Get all users from the database (excluding sensitive information)"""
         try:
-            users = list(self.users.find(
+            users = list(self.db.users.find(
                 {},
                 {
                     'password': 0,  # Exclude password
@@ -234,7 +240,7 @@ class MongoDB:
     def get_university_by_id(self, university_id: str) -> Optional[Dict]:
         """Get university by ID"""
         try:
-            university = self.universities.find_one({'id': university_id})
+            university = self.db.universities.find_one({'id': university_id})
             if university:
                 university['_id'] = str(university['_id'])
             return university
@@ -256,7 +262,7 @@ class MongoDB:
 
             if 'selected_universities' in safe_update_data:
                 universities = safe_update_data.pop('selected_universities', [])
-                self.users.update_one(  # Changed
+                self.db.users.update_one(  # Changed
                     {'email': email},
                     {'$set': {'selected_universities': []}}
                 )
@@ -265,7 +271,7 @@ class MongoDB:
                         'selected_universities': {'$each': universities}
                     }
 
-            result = self.users.update_one(  # Changed
+            result = self.db.users.update_one(  # Changed
                 {'email': email},
                 update_doc
             )
@@ -318,7 +324,7 @@ class MongoDB:
             else:
                 return {'error': 'Invalid action'}
 
-            result = self.users.update_one(
+            result = self.db.users.update_one(
                 {'email': email},
                 update
             )
@@ -346,7 +352,7 @@ class MongoDB:
                 }
             }
             
-            result = self.users.update_one(
+            result = self.db.users.update_one(
                 {'email': email},
                 {'$set': update}
             )
@@ -361,7 +367,7 @@ class MongoDB:
     def find_university_by_url(self, url: str) -> Optional[Dict]:
         """Find a university by its URL"""
         try:
-            university = self.universities.find_one({'url': url})
+            university = self.db.universities.find_one({'url': url})
             if not university:
                 return None
                 
@@ -385,7 +391,7 @@ class MongoDB:
         """Get multiple universities by their URLs"""
         try:
             # Find all universities with matching URLs
-            universities = list(self.universities.find({
+            universities = list(self.db.universities.find({
                 'url': {'$in': urls}
             }))
 
@@ -430,7 +436,7 @@ class MongoDB:
                 'last_updated': datetime.utcnow()
             }
             
-            result = self.custom_columns.insert_one(column)
+            result = self.db.custom_columns.insert_one(column)
             if not result.inserted_id:
                 return {'error': 'Failed to create column'}
                 
@@ -450,7 +456,7 @@ class MongoDB:
     def get_custom_columns(self, user_email: str) -> list:
         """Get all custom columns for a user"""
         try:
-            cursor = self.custom_columns.find({
+            cursor = self.db.custom_columns.find({
                 '$or': [
                     {'created_by': user_email},
                     {'is_global': True}
@@ -484,7 +490,7 @@ class MongoDB:
                 'last_updated': datetime.utcnow()
             }
             
-            result = self.column_data.update_one(
+            result = self.db.column_data.update_one(
                 {
                     'university_id': data['university_id'],
                     'column_id': data['column_id'],
@@ -503,7 +509,7 @@ class MongoDB:
     def get_column_data(self, user_email: str, university_ids: list) -> dict:
         """Get column data for multiple universities"""
         try:
-            cursor = self.column_data.find({
+            cursor = self.db.column_data.find({
                 'user_email': user_email,
                 'university_id': {'$in': university_ids}
             })
@@ -530,7 +536,7 @@ class MongoDB:
     def get_all_columns(self):
         """Get all custom columns from the database"""
         try:
-            return list(self.custom_columns.find())
+            return list(self.db.custom_columns.find())
         except Exception as e:
             logger.error(f"Error getting all columns: {str(e)}")
             return []
@@ -539,10 +545,10 @@ class MongoDB:
         """Get all users who have this column"""
         try:
             # Find all unique user emails that have used this column
-            users = self.column_data.distinct('user_email', {'column_id': column_id})
+            users = self.db.column_data.distinct('user_email', {'column_id': column_id})
             # If no users found, include the admin user
             if not users:
-                admin_users = self.users.find({'is_admin': True}, {'email': 1})
+                admin_users = self.db.users.find({'is_admin': True}, {'email': 1})
                 users = [user['email'] for user in admin_users]
             return users
         except Exception as e:
@@ -560,7 +566,7 @@ class MongoDB:
             data['last_updated'] = datetime.utcnow()
 
             # Upsert the data
-            result = self.column_data.update_one(
+            result = self.db.column_data.update_one(
                 {
                     'university_id': data['university_id'],
                     'column_id': data['column_id'],
@@ -587,7 +593,7 @@ class MongoDB:
         try:
             # Convert string ID to ObjectId
             obj_id = ObjectId(column_id)
-            column = self.custom_columns.find_one({'_id': obj_id})
+            column = self.db.custom_columns.find_one({'_id': obj_id})
             if column:
                 column['_id'] = str(column['_id'])
             return column
@@ -605,7 +611,7 @@ class MongoDB:
             with self.client.start_session() as session:
                 with session.start_transaction():
                     # Delete the column definition
-                    column_result = self.custom_columns.delete_one(
+                    column_result = self.db.custom_columns.delete_one(
                         {'_id': obj_id},
                         session=session
                     )
@@ -614,7 +620,7 @@ class MongoDB:
                         return {'error': 'Column not found'}
                     
                     # Delete all associated column data
-                    self.column_data.delete_many(
+                    self.db.column_data.delete_many(
                         {'column_id': str(obj_id)},
                         session=session
                     )
@@ -629,13 +635,13 @@ class MongoDB:
         """Get usage statistics for a column"""
         try:
             # Get count of data entries
-            data_count = self.column_data.count_documents({'column_id': column_id})
+            data_count = self.db.column_data.count_documents({'column_id': column_id})
             
             # Get unique universities using this column
-            unique_universities = len(self.column_data.distinct('university_id', {'column_id': column_id}))
+            unique_universities = len(self.db.column_data.distinct('university_id', {'column_id': column_id}))
             
             # Get unique users using this column
-            unique_users = len(self.column_data.distinct('user_email', {'column_id': column_id}))
+            unique_users = len(self.db.column_data.distinct('user_email', {'column_id': column_id}))
             
             return {
                 'data_entries': data_count,
@@ -658,7 +664,7 @@ class MongoDB:
                 'timestamp': datetime.utcnow()
             }
             
-            result = self.activity_logs.insert_one(activity)
+            result = self.db.activity_logs.insert_one(activity)
             return {'success': True, 'id': str(result.inserted_id)}
             
         except Exception as e:
@@ -669,7 +675,7 @@ class MongoDB:
         """Get activity logs with optional filters"""
         try:
             query = filters or {}
-            cursor = self.activity_logs.find(
+            cursor = self.db.activity_logs.find(
                 query,
                 {'_id': 0}
             ).sort('timestamp', -1).limit(limit)
@@ -680,4 +686,150 @@ class MongoDB:
             logger.error(f"Error getting activity logs: {str(e)}")
             return []
         
+    def update_university(self, university_id: str, update_data: dict) -> dict:
+        """Update university data with progress tracking"""
+        try:
+            result = self.db.universities.update_one(
+                {'id': university_id},
+                {
+                    '$set': {
+                        **update_data,
+                        'last_updated': datetime.utcnow()
+                    }
+                }
+            )
+            
+            return {
+                'success': result.modified_count > 0,
+                'error': None if result.modified_count > 0 else 'University not found'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating university: {str(e)}")
+            return {'error': str(e)}
     
+    def get_university_status(self, university_id: str) -> dict:
+        """Get current university status"""
+        try:
+            university = self.db.universities.find_one(
+                {'id': university_id},
+                {
+                    'status': 1,
+                    'progress': 1,
+                    'error': 1,
+                    'metadata': 1,
+                    'last_updated': 1
+                }
+            )
+            
+            if not university:
+                return {'error': 'University not found'}
+                
+            return {
+                'status': university.get('status', 'unknown'),
+                'progress': university.get('progress', {}),
+                'error': university.get('error'),
+                'metadata': university.get('metadata', {}),
+                'last_updated': university.get('last_updated')
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting status: {str(e)}")
+            return {'error': str(e)}
+
+    def update_university_progress(self, university_id: str, progress_data: dict) -> bool:
+        """Update university progress information"""
+        try:
+            self.db.universities.update_one(
+                {'id': university_id},
+                {
+                    '$set': {
+                        'progress': progress_data,
+                        'last_updated': datetime.utcnow()
+                    }
+                }
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error updating university progress: {str(e)}")
+            return False
+
+    def update_university_status(self, university_id: str, status: str, error: str = None) -> bool:
+        """Update university processing status"""
+        try:
+            update_data = {
+                'status': status,
+                'last_updated': datetime.utcnow()
+            }
+            if error:
+                update_data['error'] = error
+            
+            self.db.universities.update_one(
+                {'id': university_id},
+                {'$set': update_data}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error updating university status: {str(e)}")
+            return False
+
+    def get_university_progress(self, university_id: str) -> dict:
+        """Get detailed university progress"""
+        try:
+            university = self.db.universities.find_one(
+                {'id': university_id},
+                {
+                    'progress': 1,
+                    'status': 1,
+                    'error': 1,
+                    'last_updated': 1,
+                    'metadata': 1
+                }
+            )
+            if not university:
+                return {}
+                
+            return {
+                'status': university.get('status', 'unknown'),
+                'progress': university.get('progress', {}),
+                'error': university.get('error'),
+                'last_updated': university.get('last_updated'),
+                'metadata': university.get('metadata', {})
+            }
+        except Exception as e:
+            logger.error(f"Error getting university progress: {str(e)}")
+            return {}
+
+    def delete_university_column_data(self, university_id: str) -> Dict:
+        """Delete all column data associated with a university"""
+        try:
+            # Delete all column data for this university
+            result = self.db.column_data.delete_many({
+                'university_id': university_id
+            })
+
+            logger.info(f"Deleted {result.deleted_count} column data entries for university {university_id}")
+            
+            return {
+                'success': True,
+                'deleted_count': result.deleted_count
+            }
+        except Exception as e:
+            logger.error(f"Error deleting university column data: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def get_column_data_for_university(self, university_id: str, column_id: str, user_email: str) -> Dict:
+        """Get column data for a specific university and user"""
+        try:
+            result = self.db.column_data.find_one({
+                'university_id': university_id,
+                'column_id': column_id,
+                'user_email': user_email
+            })
+            return result
+        except Exception as e:
+            logger.error(f"Error getting column data: {str(e)}")
+            return None

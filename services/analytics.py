@@ -16,7 +16,7 @@ def get_total_revenue(db) -> float:
     """Calculate total revenue from premium subscriptions"""
     try:
         # Find all premium users
-        premium_users = db.users.count_documents({
+        premium_users = db.db.users.count_documents({
             'is_premium': True,
             'subscription.status': 'active'
         })
@@ -49,7 +49,7 @@ def get_monthly_growth(db) -> list:
             {'$limit': 12}
         ]
         
-        results = list(db.users.aggregate(pipeline))
+        results = list(db.db.users.aggregate(pipeline))
         
         # Format results
         formatted_results = []
@@ -91,7 +91,7 @@ def get_user_activity(db) -> list:
             {'$sort': {'_id.date': 1}}
         ]
         
-        results = list(db.activity_logs.aggregate(pipeline))
+        results = list(db.db.activity_logs.aggregate(pipeline))
         
         # Format results
         formatted_results = []

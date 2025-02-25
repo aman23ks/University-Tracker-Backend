@@ -1,6 +1,6 @@
 from functools import wraps, lru_cache
-from flask import Flask, Response, make_response, request, jsonify
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask import Flask, Response, make_response, request, jsonify, stream_with_context
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, decode_token
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import timedelta
 import os
@@ -17,12 +17,22 @@ import json
 from typing import List, Dict
 from dotenv import load_dotenv
 import os
+import redis
+import time
 from flask_cors import CORS
+from datetime import datetime, timezone, timedelta
 from services.analytics import get_monthly_growth, get_user_activity, get_total_revenue
+from services.celery_worker import process_custom_columns_task, process_university_background
+from flask_socketio import SocketIO, emit, disconnect
+from services.socket_service import socketio
+from engineio.payload import Payload
+import threading
+from services.event_handler import redis_client
+from services.event_handler import publish_status_update
 
 load_dotenv()
 app = Flask(__name__)
-
+Payload.max_decode_packets = 50
 # Configure app
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
@@ -40,6 +50,13 @@ CORS(app, resources={
 
 # Initialize JWT
 jwt = JWTManager(app)
+
+redis_client = redis.Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    db=0,
+    decode_responses=True
+)
 
 # Lazy service initialization
 @lru_cache()
@@ -79,6 +96,70 @@ def handle_response(response):
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
     return response
+
+def sse_response(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        return Response(
+            stream_with_context(f(*args, **kwargs)),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Authorization',
+                'X-Accel-Buffering': 'no'  # Disable nginx buffering
+            }
+        )
+    return decorated_function
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='threading',
+    logger=True,
+    engineio_logger=True
+)
+
+@socketio.on('connect')
+def handle_connect():
+    token = request.args.get('token')
+    if not token:
+        disconnect()
+        return False
+    
+    try:
+        # Verify token
+        decoded = decode_token(token)
+        user_email = decoded['sub']
+        
+        # Get user
+        user = db.get_user(user_email)
+        if not user:
+            disconnect()
+            return False
+            
+        return True
+    except Exception as e:
+        app.logger.error(f"Socket connection error: {str(e)}")
+        disconnect()
+        return False
+    
+def start_redis_listener():
+    """Listen for Redis messages and broadcast to WebSocket clients"""
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe('university_updates')
+    
+    for message in pubsub.listen():
+        if message['type'] == 'message':
+            try:
+                data = json.loads(message['data'])
+                socketio.emit('university_update', data)
+            except Exception as e:
+                print(f"Error broadcasting message: {str(e)}")
+
+redis_thread = threading.Thread(target=start_redis_listener, daemon=True)
+redis_thread.start()
 
 def serialize_mongo(obj):
     """Convert MongoDB objects to JSON serializable format"""
@@ -143,15 +224,21 @@ def verify_token():
         print(f"Verify error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-# University routes
 @app.route('/api/universities', methods=['GET'])
 @jwt_required()
 def get_universities():
-    return jsonify(db.get_universities())
+    universities = db.get_universities()
+    
+    # Ensure each university has a status
+    for uni in universities:
+        if 'status' not in uni:
+            uni['status'] = 'pending'
+            
+    return jsonify(universities)
 
 @app.route('/api/universities', methods=['POST'])
 @jwt_required()
-async def add_university():
+def add_university():
     user_email = get_jwt_identity()
     user = db.get_user(user_email)
     if not user.get('is_admin'):
@@ -162,74 +249,249 @@ async def add_university():
         if not data or 'url' not in data or 'program' not in data or 'name' not in data:
             return jsonify({'error': 'Missing required fields'}), 400
 
-        # Process university data with crawler
-        crawler_result = await crawler.process_university(data['url'], data['program'])
-        
-        if not crawler_result['success']:
-            return jsonify({
-                'error': 'Failed to process university data',
-                'details': crawler_result.get('error', 'Unknown error')
-            }), 500
+        app.logger.info(f"Adding new university: {data['name']} ({data['url']})")
 
-        # Add to database
-        university_data = {
+        # First, check if university already exists
+        existing_uni = db.find_university_by_url(data['url'])
+        if existing_uni:
+            app.logger.warning(f"University already exists: {data['url']}")
+            return jsonify({'error': 'University already exists'}), 400
+
+        # Add initial university record with pending status
+        initial_uni_data = {
             'name': data['name'],
             'url': data['url'],
             'programs': [data['program']],
-            'metadata': {
-                'namespace': crawler_result['namespace'],
-                'pages_crawled': crawler_result['pages_crawled'],
-                'data_chunks': crawler_result['data_chunks']
-            }
+            'status': 'pending',
+            'created_at': datetime.utcnow(),
+            'last_updated': datetime.utcnow()
         }
-
-        result = db.add_university(university_data)
+        
+        result = db.add_university(initial_uni_data)
         if 'error' in result:
+            app.logger.error(f"Error adding university to database: {result['error']}")
             return jsonify(result), 500
 
-        # After successfully adding university, populate existing custom columns
-        try:
-            # Get all existing custom columns
-            columns = db.get_all_columns()
-            
-            # For each column, query RAG and save data
-            for column in columns:
-                # Generate question based on column name
-                question = f"What is the {column['name']} for this university program?"
-                
-                # Query RAG
-                rag_result = rag.query(question, crawler_result['namespace'])
-                
-                if rag_result and 'answer' in rag_result:
-                    # Save column data for all users who have this column
-                    users_with_column = db.get_users_with_column(str(column['_id']))
-                    for user_email in users_with_column:
-                        column_data = {
-                            'university_id': result['id'],
-                            'column_id': str(column['_id']),
-                            'user_email': user_email,
-                            'value': rag_result['answer']
-                        }
-                        db.save_column_data(column_data)
+        app.logger.info(f"University added to database with ID: {result['id']}")
 
-            # Return success with populated data
-            return jsonify({
-                'success': True,
-                'university': result,
-                'columns_populated': len(columns)
-            }), 201
+        # Start Celery task for web crawling only - no column processing needed
+        task = process_university_background.delay(
+            url=data['url'],
+            program=data['program'],
+            university_id=result['id'],
+            email=user_email
+        )
 
-        except Exception as e:
-            app.logger.error(f"Error populating column data: {str(e)}")
-            # Return partial success
-            return jsonify({
-                'success': True,
-                'university': result,
-                'warning': 'University added but column data population failed'
-            }), 201
+        app.logger.info(f"Started university processing task: {task.id}")
+
+        return jsonify({
+            'success': True,
+            'message': 'University addition initiated',
+            'university': {
+                'id': result['id'],
+                'name': data['name'],
+                'url': data['url'],
+                'status': 'pending'
+            },
+            'task_id': task.id
+        }), 202
 
     except Exception as e:
         app.logger.error(f"Error adding university: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    
+@app.route('/api/universities/<string:university_id>/status', methods=['GET'])
+@jwt_required()
+def get_university_status(university_id):
+    """Get detailed university processing status"""
+    try:
+        # Get progress from database
+        university = db.get_university_by_id(university_id)
+        if not university:
+            return jsonify({'error': 'University not found'}), 404
+            
+        # Get real-time progress from Redis
+        redis_progress = redis_client.hgetall(f"university_progress:{university_id}")
+        redis_status = redis_client.hgetall(f"university_status:{university_id}")
+        
+        # Combine progress data
+        progress = {
+            'total_urls': int(redis_progress.get('total_urls', 0)),
+            'processed_urls': int(redis_progress.get('processed_urls', 0)),
+            'current_batch': int(redis_progress.get('current_batch', 0)),
+            'data_chunks': int(redis_progress.get('data_chunks', 0))
+        }
+        
+        # Get detailed progress from MongoDB
+        db_progress = db.get_university_progress(university_id)
+        
+        status = {
+            'university_id': university_id,
+            'name': university.get('name'),
+            'url': university.get('url'),
+            'status': redis_status.get('status') or db_progress.get('status', 'unknown'),
+            'progress': progress,
+            'error': redis_status.get('error') or db_progress.get('error'),
+            'last_updated': (
+                datetime.fromisoformat(redis_status.get('timestamp'))
+                if redis_status.get('timestamp')
+                else db_progress.get('last_updated')
+            )
+        }
+        
+        return jsonify(status)
+        
+    except Exception as e:
+        app.logger.error(f"Error getting university status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/universities/<string:university_id>/reset', methods=['POST'])
+@jwt_required()
+def reset_university_processing(university_id):
+    """Reset processing status for a stuck university"""
+    try:
+        # Verify admin access
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+
+        # Get university
+        university = db.get_university_by_id(university_id)
+        if not university:
+            return jsonify({'error': 'University not found'}), 404
+
+        # Clear Redis keys
+        keys_to_clear = [
+            f"university_progress:{university_id}",
+            f"university_status:{university_id}",
+            f"column_progress:{university_id}"
+        ]
+        for key in keys_to_clear:
+            redis_client.delete(key)
+
+        # Reset MongoDB status
+        db.update_university(university_id, {
+            'status': 'pending',
+            'metadata': {
+                'pages_crawled': 0,
+                'data_chunks': 0
+            },
+            'last_updated': datetime.utcnow()
+        })
+
+        # Restart processing
+        task = process_university_background.delay(
+            url=university['url'],
+            program=university.get('programs', [''])[0],
+            university_id=university_id
+        )
+
+        return jsonify({
+            'message': 'Processing reset successfully',
+            'task_id': task.id
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error resetting university processing: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/universities/processing/status', methods=['GET'])
+@jwt_required()
+def get_processing_status():
+    """Get status of all currently processing universities"""
+    try:
+        # Verify admin access
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+
+        # Get all universities in processing state
+        processing_unis = db.universities.find({
+            'status': {'$in': ['pending', 'processing']}
+        })
+
+        status_info = []
+        for uni in processing_unis:
+            # Get progress from Redis
+            progress = redis_client.hgetall(f"university_progress:{uni['id']}")
+            status = redis_client.hgetall(f"university_status:{uni['id']}")
+
+            status_info.append({
+                'university_id': uni['id'],
+                'name': uni.get('name'),
+                'url': uni.get('url'),
+                'status': status.get('status', uni.get('status')),
+                'progress': {
+                    'total_urls': int(progress.get('total_urls', 0)),
+                    'processed_urls': int(progress.get('processed_urls', 0)),
+                    'current_batch': int(progress.get('current_batch', 0))
+                },
+                'last_updated': uni.get('last_updated')
+            })
+
+        return jsonify(status_info)
+
+    except Exception as e:
+        app.logger.error(f"Error getting processing status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/universities/cleanup', methods=['POST'])
+@jwt_required()
+def cleanup_stale_processing():
+    """Cleanup stale processing states"""
+    try:
+        # Verify admin access
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+
+        # Find universities stuck in processing
+        cutoff_time = datetime.utcnow() - timedelta(hours=2)  # 2 hours threshold
+        stale_unis = db.universities.find({
+            'status': {'$in': ['pending', 'processing']},
+            'last_updated': {'$lt': cutoff_time}
+        })
+
+        cleaned_count = 0
+        for uni in stale_unis:
+            # Clear Redis keys
+            redis_client.delete(f"university_progress:{uni['id']}")
+            redis_client.delete(f"university_status:{uni['id']}")
+            redis_client.delete(f"column_progress:{uni['id']}")
+
+            # Update MongoDB status
+            db.update_university(uni['id'], {
+                'status': 'failed',
+                'error': 'Processing timed out',
+                'last_updated': datetime.utcnow()
+            })
+
+            cleaned_count += 1
+
+        return jsonify({
+            'message': f'Cleaned up {cleaned_count} stale processing states',
+            'cleaned_count': cleaned_count
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error cleaning up stale processing: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/universities/<string:id>', methods=['GET'])
+@jwt_required()
+def get_university_by_id(id):
+    try:
+        # Get university details
+        university = db.get_university_by_id(id)
+        if not university:
+            return jsonify({'error': 'University not found'}), 404
+
+        return jsonify(university)
+    except Exception as e:
+        app.logger.error(f"Error getting university: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/universities/<string:id>', methods=['DELETE'])
@@ -247,20 +509,42 @@ def delete_university(id):
         if not university:
             return jsonify({'error': 'University not found'}), 404
 
+        # Generate the correct namespace
+        namespace = f"uni_{id}"
+        app.logger.info(f"Deleting university data from namespace: {namespace}")
+
+        # Delete from Pinecone
+        try:
+            index = crawler.index
+            # Delete all vectors in the namespace
+            delete_response = index.delete(
+                deleteAll=True,
+                namespace=namespace
+            )
+            app.logger.info(f"Pinecone delete response: {delete_response}")
+        except Exception as e:
+            app.logger.error(f"Error deleting from Pinecone: {str(e)}")
+            # Continue with database deletion even if Pinecone deletion fails
+
         # Delete from database
         result = db.delete_university(id)
         if 'error' in result:
             return jsonify(result), 400
 
-        # Delete from Pinecone if namespace exists
-        if 'metadata' in university and 'namespace' in university['metadata']:
-            try:
-                index = crawler.index
-                print(university['metadata']['namespace'])
-                index.delete(deleteAll=True, namespace=university['metadata']['namespace'])
-            except Exception as e:
-                app.logger.error(f"Error deleting from Pinecone: {str(e)}")
+        # Remove any related column data
+        try:
+            db.delete_university_column_data(id)
+        except Exception as e:
+            app.logger.error(f"Error deleting column data: {str(e)}")
 
+        # Clean up any processing data in Redis
+        try:
+            redis_client.delete(f"university_progress:{id}")
+            redis_client.delete(f"column_progress:{id}")
+        except Exception as e:
+            app.logger.error(f"Error cleaning Redis data: {str(e)}")
+
+        app.logger.info(f"Successfully deleted university {id} and all related data")
         return jsonify({'message': 'University deleted successfully'})
 
     except Exception as e:
@@ -287,10 +571,21 @@ def query_rag():
             return jsonify({'error': 'University not found'}), 404
 
         # Use university ID as namespace
-        namespace = university['metadata']['namespace']
+        namespace = f"uni_{university['id']}"
 
-        # Get answer from RAG service
-        result = rag.query(data['question'], namespace)
+        # Get answer from RAG service using asyncio.run()
+        try:
+            # Create a new event loop for this request
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(rag.query(data['question'], namespace))
+            loop.close()
+        except Exception as e:
+            app.logger.error(f"RAG query execution error: {str(e)}")
+            return jsonify({
+                'error': 'RAG query failed',
+                'details': str(e)
+            }), 500
 
         if 'error' in result:
             return jsonify({
@@ -433,6 +728,13 @@ def add_university_to_user():
             app.logger.warning(f"[Backend] University already selected: {university['url']}")
             return jsonify({'error': 'University already selected'}), 400
 
+        publish_status_update(university['id'], 'processing', {
+            'university_id': university['id'],
+            'url': university['url'],
+            'name': university.get('name', ''),
+            'program': university.get('programs', [''])[0] if isinstance(university.get('programs'), list) else ''
+        })
+
         # Add university to user's selection
         result = db.update_user_universities(
             current_user,
@@ -442,53 +744,42 @@ def add_university_to_user():
 
         if 'error' in result:
             return jsonify(result), 400
+        
+        # Construct namespace
+        namespace = f"uni_{university['id']}"
+        app.logger.info(f"[Backend] Using namespace: {namespace}")
 
-        # Get custom columns for the user and populate data
-        columns = db.get_custom_columns(current_user)
-        column_data = {}
-        
-        app.logger.info(f"[Backend] Populating {len(columns)} columns for new university")
-        
-        # Get university namespace from metadata
-        namespace = university['metadata'].get('namespace')
-        
-        # For each column, query RAG and store data
-        for column in columns:
-            try:
-                # Generate question based on column name
-                question = f"What is the {column['name']} for this university program?"
-                
-                # Query RAG
-                rag_result = rag.query(question, namespace)
-                
-                if rag_result and 'answer' in rag_result:
-                    # Save column data
-                    save_data = {
-                        'university_id': data['university_id'],
-                        'column_id': str(column['_id']),
-                        'user_email': current_user,
-                        'value': rag_result['answer']
-                    }
-                    
-                    db.save_column_data(save_data)
-                    
-                    # Store for response
-                    column_data[str(column['_id'])] = {
-                        'value': rag_result['answer'],
-                        'last_updated': datetime.utcnow().isoformat()
-                    }
-                    
-                    app.logger.info(f"[Backend] Populated column {column['name']} with RAG data")
-                
-            except Exception as e:
-                app.logger.error(f"[Backend] Error populating column {column['name']}: {str(e)}")
+        # Start column processing only if not admin
+        if not user.get('is_admin'):
+            app.logger.info(f"[Backend] Starting column processing for user {current_user}")
+            task = process_custom_columns_task.delay(
+                university_id=university['id'],
+                namespace=namespace,
+                user_email=current_user
+            )
+            app.logger.info(f"[Backend] Started column processing task: {task.id}")
 
-        app.logger.info("[Backend] Successfully added university with column data")
-        return jsonify({
-            'message': 'University added successfully',
-            'university': university,
-            'columnData': column_data
-        })
+            return jsonify({
+                'message': 'University added successfully',
+                'university': {
+                    'id': str(university['_id']),
+                    'name': university.get('name'),
+                    'url': university['url'],
+                    'status': university.get('status')
+                },
+                'columnProcessingTaskId': task.id
+            })
+        else:
+            app.logger.info(f"[Backend] Skipping column processing for admin user")
+            return jsonify({
+                'message': 'University added successfully',
+                'university': {
+                    'id': str(university['_id']),
+                    'name': university.get('name'),
+                    'url': university['url'],
+                    'status': university.get('status')
+                }
+            })
 
     except Exception as e:
         app.logger.error(f"[Backend] Error adding university to user: {str(e)}")
@@ -906,33 +1197,45 @@ def update_profile():
 @jwt_required()
 def get_analytics():
     try:
+        app.logger.info("Fetching current user identity")
         current_user = get_jwt_identity()
+        
+        app.logger.info(f"Fetching user details for: {current_user}")
         user = db.get_user(current_user)
         
         if not user.get('is_admin'):
+            app.logger.warning("Unauthorized access attempt")
             return jsonify({'error': 'Unauthorized'}), 403
-            
-        # Get total users count
-        total_users = db.users.count_documents({})
         
-        # Get premium users count
-        premium_users = db.users.count_documents({'is_premium': True})
+        app.logger.info("Fetching total users count")
+        total_users = db.db.users.count_documents({})
+        app.logger.info(f"Total users: {total_users}")
         
-        # Calculate premium percentage
+        app.logger.info("Fetching premium users count")
+        premium_users = db.db.users.count_documents({'is_premium': True})
+        app.logger.info(f"Premium users: {premium_users}")
+        
+        app.logger.info("Calculating premium user percentage")
         premium_percentage = round((premium_users / total_users) * 100 if total_users > 0 else 0, 1)
+        app.logger.info(f"Premium percentage: {premium_percentage}%")
         
-        # Get total universities
-        total_universities = db.universities.count_documents({})
+        app.logger.info("Fetching total universities count")
+        total_universities = db.db.universities.count_documents({})
+        app.logger.info(f"Total universities: {total_universities}")
         
-        # Calculate total revenue
+        app.logger.info("Calculating total revenue")
         total_revenue = get_total_revenue(db)
+        app.logger.info(f"Total revenue: {total_revenue}")
         
-        # Get growth data
+        app.logger.info("Fetching monthly growth data")
         monthly_growth = get_monthly_growth(db)
+        app.logger.info(f"Monthly growth: {monthly_growth}")
         
-        # Get activity data
+        app.logger.info("Fetching user activity data")
         user_activity = get_user_activity(db)
+        app.logger.info(f"User activity: {user_activity}")
         
+        app.logger.info("Returning analytics response")
         return jsonify({
             'totalUsers': total_users,
             'premiumUsers': premium_users,
@@ -946,8 +1249,7 @@ def get_analytics():
     except Exception as e:
         app.logger.error(f"Error fetching analytics: {str(e)}")
         return jsonify({'error': str(e)}), 500
-    
-# Error handlers
+
 @app.errorhandler(500)
 def handle_500_error(e):
     app.logger.error(f"Internal Server Error: {str(e)}")
@@ -964,4 +1266,9 @@ def handle_404_error(e):
     }), 404
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    socketio.run(
+        app,
+        debug=True,
+        port=5000,
+        allow_unsafe_werkzeug=True  # Add this for development
+    )
