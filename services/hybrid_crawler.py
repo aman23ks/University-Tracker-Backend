@@ -679,7 +679,7 @@ class HybridCrawler:
 
             # Update MongoDB through database service
             from services.database import MongoDB
-            db = MongoDB(os.getenv('MONGO_URI'))
+            db = MongoDB(os.getenv('MONGODB_URI'))
             db.update_university(self.university_id, status_data)
 
         except Exception as e:
