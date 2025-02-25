@@ -6,6 +6,8 @@ from datetime import timedelta
 import os
 import json
 import asyncio
+import threading
+import time
 from dotenv import load_dotenv
 from services.database import MongoDB
 from services.rag_retrieval import RAGRetrieval
@@ -27,8 +29,8 @@ from flask_socketio import SocketIO, emit, disconnect
 from services.socket_service import socketio
 from engineio.payload import Payload
 import threading
-from services.event_handler import redis_client
-from services.event_handler import publish_status_update
+from services.event_handler import redis_client, publish_status_update
+
 
 load_dotenv()
 app = Flask(__name__)
@@ -51,9 +53,15 @@ CORS(app, resources={
 # Initialize JWT
 jwt = JWTManager(app)
 
+# Configure Redis based on environment
+redis_host = os.getenv('REDISHOST', os.getenv('REDIS_HOST', 'localhost'))
+redis_port = int(os.getenv('REDISPORT', os.getenv('REDIS_PORT', 6379)))
+redis_url = os.getenv('REDIS_URL', f'redis://{redis_host}:{redis_port}/0')
+
+# Initialize Redis client for the app
 redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST', 'localhost'),
-    port=int(os.getenv('REDIS_PORT', 6379)),
+    host=redis_host,
+    port=redis_port,
     db=0,
     decode_responses=True
 )
@@ -61,7 +69,8 @@ redis_client = redis.Redis(
 # Lazy service initialization
 @lru_cache()
 def get_services():
-    db = MongoDB(os.getenv('MONGO_URI'))
+    mongo_uri = os.getenv('MONGODB_URI')
+    db = MongoDB(mongo_uri)
     rag = RAGRetrieval(
         openai_api_key=os.getenv('OPENAI_API_KEY'),
         pinecone_api_key=os.getenv('PINECONE_API_KEY'),
@@ -118,7 +127,8 @@ socketio = SocketIO(
     cors_allowed_origins="*",
     async_mode='threading',
     logger=True,
-    engineio_logger=True
+    engineio_logger=True,
+    message_queue=redis_url  # Use Redis as message queue for scaling
 )
 
 @socketio.on('connect')
@@ -274,6 +284,13 @@ def add_university():
 
         app.logger.info(f"University added to database with ID: {result['id']}")
 
+        # Send initial processing status via Redis
+        publish_status_update(result['id'], 'processing', {
+            'url': data['url'],
+            'name': data['name'],
+            'program': data['program']
+        })
+
         # Start Celery task for web crawling only - no column processing needed
         task = process_university_background.delay(
             url=data['url'],
@@ -291,7 +308,7 @@ def add_university():
                 'id': result['id'],
                 'name': data['name'],
                 'url': data['url'],
-                'status': 'pending'
+                'status': 'processing'
             },
             'task_id': task.id
         }), 202
@@ -408,7 +425,7 @@ def get_processing_status():
             return jsonify({'error': 'Unauthorized'}), 403
 
         # Get all universities in processing state
-        processing_unis = db.universities.find({
+        processing_unis = db.db.universities.find({
             'status': {'$in': ['pending', 'processing']}
         })
 
@@ -450,7 +467,7 @@ def cleanup_stale_processing():
 
         # Find universities stuck in processing
         cutoff_time = datetime.utcnow() - timedelta(hours=2)  # 2 hours threshold
-        stale_unis = db.universities.find({
+        stale_unis = db.db.universities.find({
             'status': {'$in': ['pending', 'processing']},
             'last_updated': {'$lt': cutoff_time}
         })
@@ -728,6 +745,7 @@ def add_university_to_user():
             app.logger.warning(f"[Backend] University already selected: {university['url']}")
             return jsonify({'error': 'University already selected'}), 400
 
+        # Send processing status notification IMMEDIATELY, before database updates
         publish_status_update(university['id'], 'processing', {
             'university_id': university['id'],
             'url': university['url'],
@@ -744,7 +762,7 @@ def add_university_to_user():
 
         if 'error' in result:
             return jsonify(result), 400
-        
+
         # Construct namespace
         namespace = f"uni_{university['id']}"
         app.logger.info(f"[Backend] Using namespace: {namespace}")
@@ -755,7 +773,9 @@ def add_university_to_user():
             task = process_custom_columns_task.delay(
                 university_id=university['id'],
                 namespace=namespace,
-                user_email=current_user
+                user_email=current_user,
+                url=university['url'],
+                program=university.get('programs', [''])[0] if isinstance(university.get('programs'), list) else ''
             )
             app.logger.info(f"[Backend] Started column processing task: {task.id}")
 
@@ -765,11 +785,24 @@ def add_university_to_user():
                     'id': str(university['_id']),
                     'name': university.get('name'),
                     'url': university['url'],
-                    'status': university.get('status')
+                    'status': 'processing'  # Set status to processing
                 },
                 'columnProcessingTaskId': task.id
             })
         else:
+            # For admin, still emit the completed status after a delay
+            # This is simpler than dealing with Celery tasks for admin users
+            def emit_completed_later():
+                time.sleep(2)  # Wait 2 seconds
+                publish_status_update(university['id'], 'completed', {
+                    'university_id': university['id'],
+                    'url': university['url'],
+                    'name': university.get('name', '')
+                })
+            
+            # Start background thread to emit completion
+            threading.Thread(target=emit_completed_later).start()
+            
             app.logger.info(f"[Backend] Skipping column processing for admin user")
             return jsonify({
                 'message': 'University added successfully',
@@ -777,7 +810,7 @@ def add_university_to_user():
                     'id': str(university['_id']),
                     'name': university.get('name'),
                     'url': university['url'],
-                    'status': university.get('status')
+                    'status': 'processing'  # Set status to processing
                 }
             })
 
@@ -1197,45 +1230,33 @@ def update_profile():
 @jwt_required()
 def get_analytics():
     try:
-        app.logger.info("Fetching current user identity")
         current_user = get_jwt_identity()
-        
-        app.logger.info(f"Fetching user details for: {current_user}")
         user = db.get_user(current_user)
         
         if not user.get('is_admin'):
-            app.logger.warning("Unauthorized access attempt")
             return jsonify({'error': 'Unauthorized'}), 403
-        
-        app.logger.info("Fetching total users count")
+            
+        # Get total users count
         total_users = db.db.users.count_documents({})
-        app.logger.info(f"Total users: {total_users}")
         
-        app.logger.info("Fetching premium users count")
+        # Get premium users count
         premium_users = db.db.users.count_documents({'is_premium': True})
-        app.logger.info(f"Premium users: {premium_users}")
         
-        app.logger.info("Calculating premium user percentage")
+        # Calculate premium percentage
         premium_percentage = round((premium_users / total_users) * 100 if total_users > 0 else 0, 1)
-        app.logger.info(f"Premium percentage: {premium_percentage}%")
         
-        app.logger.info("Fetching total universities count")
+        # Get total universities
         total_universities = db.db.universities.count_documents({})
-        app.logger.info(f"Total universities: {total_universities}")
         
-        app.logger.info("Calculating total revenue")
+        # Calculate total revenue
         total_revenue = get_total_revenue(db)
-        app.logger.info(f"Total revenue: {total_revenue}")
         
-        app.logger.info("Fetching monthly growth data")
+        # Get growth data
         monthly_growth = get_monthly_growth(db)
-        app.logger.info(f"Monthly growth: {monthly_growth}")
         
-        app.logger.info("Fetching user activity data")
+        # Get activity data
         user_activity = get_user_activity(db)
-        app.logger.info(f"User activity: {user_activity}")
         
-        app.logger.info("Returning analytics response")
         return jsonify({
             'totalUsers': total_users,
             'premiumUsers': premium_users,
@@ -1249,6 +1270,84 @@ def get_analytics():
     except Exception as e:
         app.logger.error(f"Error fetching analytics: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/universities/batch-status', methods=['POST'])
+@jwt_required()
+def get_batch_status():
+    """Get status updates for multiple universities"""
+    try:
+        data = request.json
+        if not data or 'university_ids' not in data:
+            return jsonify({'error': 'University IDs required'}), 400
+            
+        university_ids = data['university_ids']
+        if not university_ids:
+            return jsonify([]), 200
+            
+        statuses = []
+        
+        for uni_id in university_ids:
+            # Try to get latest status from Redis
+            status_data = redis_client.get(f"latest_status:{uni_id}")
+            if status_data:
+                statuses.append(json.loads(status_data))
+            else:
+                # Fallback to database
+                uni = db.get_university_by_id(uni_id)
+                if uni:
+                    statuses.append({
+                        'university_id': uni_id,
+                        'status': uni.get('status', 'unknown'),
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+                    
+        return jsonify(statuses)
+    except Exception as e:
+        app.logger.error(f"Error getting batch status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/healthcheck', methods=['GET'])
+def healthcheck():
+    """Health check endpoint for deployment monitoring"""
+    try:
+        # Test database connection
+        db_status = "error"
+        try:
+            # Try to get a user count as a basic DB test
+            user_count = db.db.users.count_documents({})
+            db_status = "ok"
+        except Exception as db_err:
+            db_status = f"error: {str(db_err)}"
+        
+        # Test Redis connection
+        redis_status = "error"
+        try:
+            test_key = f"healthcheck_{datetime.utcnow().timestamp()}"
+            redis_client.set(test_key, "test_value")
+            redis_value = redis_client.get(test_key)
+            redis_client.delete(test_key)
+            redis_status = "ok" if redis_value == "test_value" else "error: values don't match"
+        except Exception as redis_err:
+            redis_status = f"error: {str(redis_err)}"
+        
+        # Return status summary
+        return jsonify({
+            'status': 'ok',
+            'timestamp': datetime.utcnow().isoformat(),
+            'environment': os.getenv('FLASK_ENV', 'production'),
+            'services': {
+                'web': 'ok',
+                'database': db_status,
+                'redis': redis_status
+            }
+        })
+    except Exception as e:
+        app.logger.error(f"Healthcheck failed: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
 
 @app.errorhandler(500)
 def handle_500_error(e):
@@ -1266,9 +1365,10 @@ def handle_404_error(e):
     }), 404
 
 if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
     socketio.run(
         app,
-        debug=True,
-        port=5000,
-        allow_unsafe_werkzeug=True  # Add this for development
+        debug=os.getenv('FLASK_ENV') == 'development',
+        port=port,
+        host='0.0.0.0'
     )

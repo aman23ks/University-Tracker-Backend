@@ -1,5 +1,3 @@
-# backend/routes/analytics.py
-
 from datetime import datetime, timedelta
 from calendar import month_abbr
 import logging

@@ -14,18 +14,25 @@ from functools import wraps
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Redis
+# Configure Redis connection based on environment
+redis_host = os.getenv('REDISHOST', os.getenv('REDIS_HOST', 'localhost'))
+redis_port = int(os.getenv('REDISPORT', os.getenv('REDIS_PORT', 6379)))
+redis_url = os.getenv('REDIS_URL', f'redis://{redis_host}:{redis_port}/0')
+
+# Initialize Redis client for Celery worker
 redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST', 'localhost'),
-    port=int(os.getenv('REDIS_PORT', 6379)),
+    host=redis_host,
+    port=redis_port,
     db=0,
     decode_responses=True
 )
 
-# Initialize Celery
-celery = Celery('uni_tracker',
-                broker=os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
-                backend=os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
+# Initialize Celery with the Redis URL
+celery = Celery(
+    'uni_tracker',
+    broker=redis_url,
+    backend=redis_url
+)
 
 # Celery settings
 celery.conf.update(
@@ -47,8 +54,8 @@ celery.conf.update(
     worker_concurrency=2
 )
 
-# Initialize services
-db = MongoDB(os.getenv('MONGO_URI'))
+# Initialize services in worker
+db = MongoDB(os.getenv('MONGODB_URI'))
 rag = RAGRetrieval(
     openai_api_key=os.getenv('OPENAI_API_KEY'),
     pinecone_api_key=os.getenv('PINECONE_API_KEY'),
@@ -61,7 +68,7 @@ def ensure_db_connection(f):
     def wrapper(*args, **kwargs):
         global db
         if db is None:
-            db = MongoDB(os.getenv('MONGO_URI'))
+            db = MongoDB(os.getenv('MONGODB_URI'))
         db.connect()
         return f(*args, **kwargs)
     return wrapper
@@ -139,6 +146,13 @@ def process_university_background(self, url: str, program: str, university_id: s
                     'last_updated': datetime.utcnow()
                 })
                 
+                # Also publish status update for real-time updates
+                publish_status_update(university_id, 'processing', {
+                    'url': url,
+                    'program': program,
+                    'progress': progress_data
+                })
+                
             except Exception as e:
                 logger.error(f"Error in progress callback: {str(e)}")
 
@@ -169,6 +183,12 @@ def process_university_background(self, url: str, program: str, university_id: s
                 'last_updated': datetime.utcnow()
             })
             
+            publish_status_update(university_id, 'failed', {
+                'error': error_msg,
+                'url': url,
+                'program': program
+            })
+            
             return False
 
         stored_count = crawler_result.get('stored_count', 0)
@@ -197,6 +217,12 @@ def process_university_background(self, url: str, program: str, university_id: s
                 url=url,
                 program=program
             )
+        else:
+            # If no email provided, still publish completion status
+            publish_status_update(university_id, 'completed', {
+                'url': url,
+                'program': program
+            })
 
         return True
 
@@ -216,7 +242,9 @@ def process_university_background(self, url: str, program: str, university_id: s
         })
 
         publish_status_update(university_id, 'failed', {
-            'error': str(e)
+            'error': str(e),
+            'url': url,
+            'program': program
         })
         
         return False
@@ -279,6 +307,11 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
         columns = db.get_custom_columns(user_email)
         if not columns:
             logger.info(f"No columns found for user {user_email}")
+            # Still publish completed status if no columns to process
+            publish_status_update(university_id, 'completed', {
+                'url': url,
+                'program': program
+            })
             return True
 
         total_columns = len(columns)
@@ -294,6 +327,17 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
                 'start_time': datetime.utcnow().isoformat()
             }
         )
+        
+        # Update status to processing columns
+        publish_status_update(university_id, 'processing', {
+            'url': url,
+            'program': program,
+            'message': 'Processing column data',
+            'column_progress': {
+                'total': total_columns,
+                'processed': 0
+            }
+        })
         
         batch_size = 5
         for i in range(0, len(columns), batch_size):
@@ -327,6 +371,7 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
                     logger.error(f"Error processing column {column.get('name')}: {str(e)}")
                     continue
             
+            # Update progress in Redis and publish update
             redis_client.hset(
                 progress_key,
                 mapping={
@@ -335,6 +380,16 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
                     'current_batch': f"{i+1}/{total_columns}"
                 }
             )
+            
+            publish_status_update(university_id, 'processing', {
+                'url': url,
+                'program': program,
+                'message': 'Processing column data',
+                'column_progress': {
+                    'total': total_columns,
+                    'processed': processed
+                }
+            })
         
         redis_client.hset(
             progress_key,
@@ -347,9 +402,11 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
         )
         redis_client.expire(progress_key, 86400)
         
+        # Send final completed status
         publish_status_update(university_id, 'completed', {
             'url': url,
-            'program': program
+            'program': program,
+            'message': 'All processing completed'
         })
         
         logger.info(f"Completed processing {processed}/{total_columns} columns for university {university_id}")
@@ -368,6 +425,8 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
             )
         
         publish_status_update(university_id, 'failed', {
+            'url': url,
+            'program': program,
             'error': str(e)
         })
         return False
@@ -377,7 +436,7 @@ def cleanup_stale_tasks():
     try:
         two_hours_ago = datetime.utcnow() - timedelta(hours=2)
         
-        stuck_unis = db.universities.find({
+        stuck_unis = db.db.universities.find({
             'status': {'$in': ['initializing', 'processing']},
             'last_updated': {'$lt': two_hours_ago}
         })
@@ -394,6 +453,11 @@ def cleanup_stale_tasks():
             
             redis_client.delete(f"university_progress:{uni_id}")
             redis_client.delete(f"column_progress:{uni_id}")
+            
+            # Publish status update for frontend
+            publish_status_update(uni_id, 'failed', {
+                'error': 'Processing timed out after 2 hours'
+            })
             
             cleaned += 1
             
