@@ -6,8 +6,8 @@ buildCommand = "pip install -r requirements.txt"
 startCommand = "gunicorn --worker-class eventlet -w 1 app:app"
 healthcheckPath = "/api/healthcheck"
 healthcheckTimeout = 300
-restartPolicyType = "on-failure"
-restartPolicyMaxRetries = 10
+restartPolicy = "on-failure"  # Changed from restartPolicyType
+maxRestarts = 10  # Changed from restartPolicyMaxRetries
 
 [env]
 PORT = "5000"
