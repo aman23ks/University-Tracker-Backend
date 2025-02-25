@@ -175,15 +175,6 @@ def serialize_mongo(obj):
     """Convert MongoDB objects to JSON serializable format"""
     return json.loads(json_util.dumps(obj))
 
-@app.route('/', methods=['GET'])
-def root():
-    """Root endpoint for health checks"""
-    return jsonify({
-        'status': 'ok',
-        'service': 'University Tracker API',
-        'version': '1.0.0'
-    })
-
 @app.route('/api/auth/register', methods=['POST'])
 def register():
     data = request.json
@@ -1313,21 +1304,6 @@ def get_batch_status():
     except Exception as e:
         app.logger.error(f"Error getting batch status: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/healthcheck', methods=['GET'])
-def healthcheck():
-    """Health check endpoint for deployment monitoring"""
-    try:
-        return jsonify({
-            'status': 'ok',
-            'timestamp': datetime.utcnow().isoformat()
-        })
-    except Exception as e:
-        app.logger.error(f"Healthcheck failed: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
 
 @app.errorhandler(500)
 def handle_500_error(e):
