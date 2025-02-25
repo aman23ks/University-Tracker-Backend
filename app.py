@@ -175,7 +175,15 @@ def serialize_mongo(obj):
     """Convert MongoDB objects to JSON serializable format"""
     return json.loads(json_util.dumps(obj))
 
-# Authentication routes
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint for health checks"""
+    return jsonify({
+        'status': 'ok',
+        'service': 'University Tracker API',
+        'version': '1.0.0'
+    })
+
 @app.route('/api/auth/register', methods=['POST'])
 def register():
     data = request.json
