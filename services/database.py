@@ -62,6 +62,7 @@ class MongoDB:
                 'is_premium': False,
                 'is_admin': data['email'].endswith('@admin.com'),
                 'selected_universities': [],
+                'university_selections': [],
                 'created_at': datetime.utcnow(),
                 'last_login': datetime.utcnow(),
                 'subscription': {
@@ -833,3 +834,337 @@ class MongoDB:
         except Exception as e:
             logger.error(f"Error getting column data: {str(e)}")
             return None
+        
+    def update_user_university_visibility(self, email: str, is_premium: bool) -> Dict:
+        """
+        Update the visibility of universities for a user based on subscription status.
+        When is_premium is False, only the first 3 universities remain visible.
+        When is_premium is True, all universities become visible.
+        """
+        try:
+            # Get user data
+            user = self.get_user(email)
+            if not user:
+                return {'error': 'User not found'}
+                
+            # Get all selected university URLs
+            selected_urls = user.get('selected_universities', [])
+            if not selected_urls:
+                return {'success': True, 'message': 'No universities found', 'updated': 0}
+                
+            # Get university details to get their IDs
+            universities = self.get_universities_by_urls(selected_urls)
+            
+            # Sort universities based on their position in selected_universities array
+            # This ensures consistent visibility when subscription expires
+            sorted_universities = []
+            for url in selected_urls:
+                matching_unis = [u for u in universities if u['url'] == url]
+                if matching_unis:
+                    sorted_universities.append(matching_unis[0])
+            
+            # Create or update visibility records
+            bulk_ops = []
+            update_count = 0
+            
+            for i, uni in enumerate(sorted_universities):
+                uni_id = uni.get('id', str(uni['_id']))
+                
+                # When not premium, only first 3 are visible
+                hidden = not is_premium and i >= 3
+                
+                # Update visibility record
+                result = self.db.university_visibility.update_one(
+                    {'user_email': email, 'university_id': uni_id},
+                    {'$set': {
+                        'hidden': hidden,
+                        'position': i,
+                        'last_updated': datetime.utcnow()
+                    }},
+                    upsert=True
+                )
+                
+                if result.modified_count or result.upserted_id:
+                    update_count += 1
+            
+            # Return success with count of updated records
+            return {
+                'success': True, 
+                'updated': update_count, 
+                'total': len(sorted_universities)
+            }
+                
+        except Exception as e:
+            logger.error(f"Error updating university visibility: {str(e)}")
+            return {'error': str(e)}
+    
+    def get_visible_universities(self, email: str) -> List[Dict]:
+        """
+        Get only the visible universities for a user.
+        For free users, this returns at most 3 universities.
+        For premium users, this returns all their universities.
+        """
+        try:
+            user = self.get_user(email)
+            if not user:
+                return []
+                
+            # Get all selected university URLs
+            selected_urls = user.get('selected_universities', [])
+            
+            # No universities selected
+            if not selected_urls:
+                return []
+                
+            # Get all university details
+            all_universities = self.get_universities_by_urls(selected_urls)
+            
+            # If premium or admin, return all universities
+            if user.get('is_premium', False) or user.get('is_admin', False):
+                return all_universities
+                
+            # For free users, get hidden status
+            visibility_records = list(self.db.university_visibility.find(
+                {'user_email': email}
+            ))
+            
+            # If no visibility records exist yet, create them
+            if not visibility_records:
+                # For backward compatibility, mark only first 3 as visible
+                for i, uni in enumerate(all_universities):
+                    self.db.university_visibility.insert_one({
+                        'user_email': email,
+                        'university_id': uni['id'],
+                        'hidden': i >= 3
+                    })
+                    
+                # Return only first 3
+                return all_universities[:3]
+                
+            # Build dictionary of hidden status
+            hidden_map = {
+                record['university_id']: record['hidden'] 
+                for record in visibility_records
+            }
+            
+            # Filter universities by visibility
+            visible_universities = [
+                uni for uni in all_universities
+                if not hidden_map.get(uni['id'], False)
+            ]
+            
+            return visible_universities
+            
+        except Exception as e:
+            logger.error(f"Error getting visible universities: {str(e)}")
+            return []
+        
+    def clear_pending_columns(self, email: str) -> Dict:
+        """Remove pending columns after they've been processed"""
+        try:
+            result = self.db.pending_columns.delete_many({'user_email': email})
+            return {'success': True, 'deleted_count': result.deleted_count}
+            
+        except Exception as e:
+            logger.error(f"Error clearing pending columns: {str(e)}")
+            return {'error': str(e)}
+        
+    
+    def init_university_visibility(self, email: str) -> Dict:
+        """Initialize visibility for new user or when adding first universities"""
+        try:
+            user = self.get_user(email)
+            if not user:
+                return {'error': 'User not found'}
+                
+            selected_urls = user.get('selected_universities', [])
+            if not selected_urls:
+                return {'success': True, 'message': 'No universities to initialize'}
+                
+            # Get university details
+            universities = self.get_universities_by_urls(selected_urls)
+            
+            # Set visibility based on premium status
+            is_premium = user.get('is_premium', False)
+            
+            visibility_records = []
+            for i, uni in enumerate(universities):
+                visibility_records.append({
+                    'user_email': email,
+                    'university_id': uni['id'],
+                    'hidden': not is_premium and i >= 3
+                })
+                
+            # Insert all records in bulk if they don't exist
+            for record in visibility_records:
+                self.db.university_visibility.update_one(
+                    {
+                        'user_email': record['user_email'],
+                        'university_id': record['university_id']
+                    },
+                    {'$set': record},
+                    upsert=True
+                )
+                
+            return {'success': True}
+            
+        except Exception as e:
+            logger.error(f"Error initializing university visibility: {str(e)}")
+            return {'error': str(e)}
+    
+    def get_university_visibility_stats(self, email: str) -> Dict:
+        """Get statistics about visible and hidden universities for a user"""
+        try:
+            # Count all university visibility records
+            total_count = self.db.university_visibility.count_documents({'user_email': email})
+            
+            # Count hidden universities
+            hidden_count = self.db.university_visibility.count_documents({
+                'user_email': email,
+                'hidden': True
+            })
+            
+            # Visible count is the difference
+            visible_count = total_count - hidden_count
+            
+            return {
+                'total_count': total_count,
+                'visible_count': visible_count,
+                'hidden_count': hidden_count
+            }
+        except Exception as e:
+            logger.error(f"Error getting visibility stats: {str(e)}")
+            return {
+                'total_count': 0,
+                'visible_count': 0,
+                'hidden_count': 0,
+                'error': str(e)
+            }
+            
+    def get_visible_university_ids(self, email: str) -> List[str]:
+        """Get list of visible university IDs for a user"""
+        try:
+            # Find all visibility records that are not hidden
+            records = self.db.university_visibility.find({
+                'user_email': email,
+                'hidden': False
+            })
+            
+            # Extract university IDs
+            university_ids = [record['university_id'] for record in records]
+            return university_ids
+            
+        except Exception as e:
+            logger.error(f"Error getting visible university IDs: {str(e)}")
+            return []
+        
+    def get_hidden_university_ids(self, email: str) -> List[str]:
+        """Get list of hidden university IDs for a user"""
+        try:
+            # Find all visibility records that are hidden
+            records = self.db.university_visibility.find({
+                'user_email': email,
+                'hidden': True
+            })
+            
+            # Extract university IDs
+            university_ids = [record['university_id'] for record in records]
+            return university_ids
+            
+        except Exception as e:
+            logger.error(f"Error getting hidden university IDs: {str(e)}")
+            return []
+    
+    def unhide_all_universities(self, email: str) -> Dict:
+        """Make all universities visible for a user"""
+        try:
+            # Update all visibility records to not hidden
+            result = self.db.university_visibility.update_many(
+                {'user_email': email},
+                {'$set': {'hidden': False, 'last_updated': datetime.utcnow()}}
+            )
+            
+            return {
+                'success': True,
+                'updated': result.modified_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Error unhiding universities: {str(e)}")
+            return {'error': str(e)}
+        
+    def add_pending_column(self, email: str, column_id: str, column_name: str) -> Dict:
+        """
+        Track columns added while a user's subscription was expired.
+        These will be processed for hidden universities when subscription is reactivated.
+        """
+        try:
+            # Add pending column record
+            result = self.db.pending_columns.update_one(
+                {'user_email': email, 'column_id': column_id},
+                {'$set': {
+                    'user_email': email,
+                    'column_id': column_id,
+                    'name': column_name,
+                    'added_at': datetime.utcnow(),
+                    'processed': False
+                }},
+                upsert=True
+            )
+            
+            return {
+                'success': True,
+                'upserted': result.upserted_id is not None,
+                'modified': result.modified_count > 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error adding pending column: {str(e)}")
+            return {'error': str(e)}
+
+    def get_pending_columns(self, email: str) -> List[Dict]:
+        """Get list of columns that need to be processed after subscription reactivation"""
+        try:
+            # Find all unprocessed pending columns
+            pending_columns = list(self.db.pending_columns.find({
+                'user_email': email,
+                'processed': False
+            }))
+            
+            # Convert ObjectId to string
+            for column in pending_columns:
+                if '_id' in column:
+                    column['_id'] = str(column['_id'])
+                
+            return pending_columns
+            
+        except Exception as e:
+            logger.error(f"Error getting pending columns: {str(e)}")
+            return []
+
+    def mark_pending_columns_processed(self, email: str, column_ids: List[str] = None) -> Dict:
+        """Mark pending columns as processed"""
+        try:
+            filter_query = {'user_email': email}
+            
+            # If specific column IDs provided, only mark those
+            if column_ids:
+                filter_query['column_id'] = {'$in': column_ids}
+            
+            # Update pending columns to processed
+            result = self.db.pending_columns.update_many(
+                filter_query,
+                {'$set': {
+                    'processed': True,
+                    'processed_at': datetime.utcnow()
+                }}
+            )
+            
+            return {
+                'success': True,
+                'processed_count': result.modified_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Error marking pending columns as processed: {str(e)}")
+            return {'error': str(e)}

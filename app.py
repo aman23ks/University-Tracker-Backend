@@ -24,7 +24,7 @@ import time
 from flask_cors import CORS
 from datetime import datetime, timezone, timedelta
 from services.analytics import get_monthly_growth, get_user_activity, get_total_revenue
-from services.celery_worker import process_custom_columns_task, process_university_background
+from services.celery_worker import process_custom_columns_task, process_pending_columns_task, process_university_background
 from flask_socketio import SocketIO, emit, disconnect
 from services.socket_service import socketio
 from engineio.payload import Payload
@@ -144,7 +144,11 @@ socketio = SocketIO(
     async_mode='threading',
     logger=True,
     engineio_logger=True,
-    message_queue=redis_url  # Use Redis as message queue for scaling
+    message_queue=redis_url,  # Use Redis as message queue for scaling
+    ping_timeout=60,
+    ping_interval=25,
+    max_http_buffer_size=10e6,  # 10MB buffer for HTTP long-polling fallback
+    async_handlers=True  # Use async handlers for better performance
 )
 
 @socketio.on('connect')
@@ -174,16 +178,32 @@ def handle_connect():
 def start_redis_listener():
     """Listen for Redis messages and broadcast to WebSocket clients"""
     pubsub = redis_client.pubsub()
-    pubsub.subscribe('university_updates')
+    pubsub.subscribe(['university_updates', 'user_updates'])  # Add user_updates channel
     
     for message in pubsub.listen():
         if message['type'] == 'message':
             try:
-                data = json.loads(message['data'])
-                socketio.emit('university_update', data)
+                # Convert to string if it's bytes
+                if isinstance(message['data'], bytes):
+                    message_data = message['data'].decode('utf-8')
+                else:
+                    message_data = message['data']
+                
+                data = json.loads(message_data)
+                channel = message['channel']
+                
+                if isinstance(channel, bytes):
+                    channel = channel.decode('utf-8')
+                
+                if channel == 'university_updates':
+                    socketio.emit('university_update', data)
+                elif channel == 'user_updates':
+                    socketio.emit('user_update', data)  # Add this handler
+                
             except Exception as e:
                 print(f"Error broadcasting message: {str(e)}")
 
+# Start Redis listener thread
 redis_thread = threading.Thread(target=start_redis_listener, daemon=True)
 redis_thread.start()
 
@@ -330,6 +350,54 @@ def add_university():
 
     except Exception as e:
         app.logger.error(f"Error adding university: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    
+@app.route('/api/universities/<string:university_id>/process-columns', methods=['POST'])
+@jwt_required()
+def process_university_columns(university_id):
+    try:
+        current_user = get_jwt_identity()
+        
+        # Check user permissions (must be premium)
+        user = db.get_user(current_user)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+            
+        if not user.get('is_premium', False) and not user.get('is_admin', False):
+            return jsonify({'error': 'Premium subscription required'}), 403
+            
+        # Get all columns
+        columns = db.get_custom_columns(current_user)
+        
+        # Get university details
+        university = db.get_university_by_id(university_id)
+        if not university:
+            return jsonify({'error': 'University not found'}), 404
+            
+        # Check if university belongs to user
+        if university['url'] not in user.get('selected_universities', []):
+            return jsonify({'error': 'University not in user selection'}), 403
+            
+        # Create namespace for RAG
+        namespace = f"uni_{university_id}"
+        
+        # Process all columns asynchronously
+        task = process_custom_columns_task.delay(
+            university_id=university_id,
+            namespace=namespace,
+            user_email=current_user,
+            url=university['url'],
+            program=university.get('programs', [''])[0] if isinstance(university.get('programs'), list) else ''
+        )
+        
+        return jsonify({
+            'success': True,
+            'message': 'Column processing initiated',
+            'task_id': task.id
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error processing university columns: {str(e)}")
         return jsonify({'error': str(e)}), 500
     
 @app.route('/api/universities/<string:university_id>/status', methods=['GET'])
@@ -701,6 +769,7 @@ def find_university():
 @jwt_required()
 def get_universities_details():
     try:
+        current_user = get_jwt_identity()
         data = request.json
         app.logger.info(f"Getting details for universities: {data}")
         
@@ -715,14 +784,24 @@ def get_universities_details():
             app.logger.warning("Empty URL list")
             return jsonify({'error': 'Empty university list'}), 400
 
-        universities = db.get_universities_by_urls(urls)
-        app.logger.info(f"Found {len(universities)} universities")
+        # Get user to check premium status
+        user = db.get_user(current_user)
+        is_premium = user.get('is_premium', False)
         
-        if not universities:
+        # Get all universities first
+        all_universities = db.get_universities_by_urls(urls)
+        if not all_universities:
             app.logger.warning(f"No universities found for URLs: {urls}")
             return jsonify({'error': 'No universities found'}), 404
 
-        return jsonify(universities)
+        # If user is not premium, limit to first 3 universities
+        if not is_premium and not user.get('is_admin', False):
+            # Get visible universities (only first 3 for free users)
+            visible_universities = all_universities[:3]
+            return jsonify(visible_universities)
+        
+        # For premium users, return all universities
+        return jsonify(all_universities)
 
     except Exception as e:
         app.logger.error(f"Error fetching university details: {str(e)}")
@@ -948,6 +1027,7 @@ def create_column():
         if not data or 'name' not in data:
             return jsonify({'error': 'Column name is required'}), 400
 
+        # Create the column
         column_data = {
             'name': data['name'],
             'type': data.get('type', 'text'),
@@ -960,6 +1040,22 @@ def create_column():
         if 'error' in result:
             return jsonify(result), 400
             
+        # Get user to determine premium status
+        user = db.get_user(current_user)
+        is_premium = user.get('is_premium', False)
+        
+        # If user is not premium, add this column to pending list for hidden universities
+        if not is_premium and 'column' in result:
+            # Get selected universities
+            selected_urls = user.get('selected_universities', [])
+            if len(selected_urls) > 3:
+                # Track this column as pending for hidden universities
+                db.add_pending_column(
+                    current_user, 
+                    result['column']['id'], 
+                    result['column']['name']
+                )
+        
         # Serialize the result
         serialized_result = serialize_mongo(result)
         return jsonify(serialized_result), 201
@@ -1006,7 +1102,26 @@ def get_column_data():
         if not data or 'university_ids' not in data:
             return jsonify({'error': 'University IDs are required'}), 400
 
-        column_data = db.get_column_data(current_user, data['university_ids'])
+        # Get user to check premium status
+        user = db.get_user(current_user)
+        is_premium = user.get('is_premium', False)
+        
+        # If user is not premium, get only visible university IDs
+        university_ids = data['university_ids']
+        if not is_premium and not user.get('is_admin', False):
+            # Get all universities
+            selected_urls = user.get('selected_universities', [])
+            all_universities = db.get_universities_by_urls(selected_urls)
+            
+            # Limit to first 3
+            visible_universities = all_universities[:3] if all_universities else []
+            visible_ids = [uni['id'] for uni in visible_universities]
+            
+            # Filter requested IDs to only include visible ones
+            university_ids = [id for id in university_ids if id in visible_ids]
+
+        # Get column data for visible universities
+        column_data = db.get_column_data(current_user, university_ids)
         return jsonify(column_data)
 
     except Exception as e:
@@ -1064,11 +1179,18 @@ def create_subscription_order():
 @app.route('/api/subscription/verify', methods=['POST'])
 @jwt_required()
 def verify_subscription():
+    """
+    Verify subscription payment and activate premium features.
+    On successful verification, this unhides all previously hidden universities
+    and processes any pending columns for those universities.
+    """
     try:
         user_email = get_jwt_identity()
         data = request.json
-        print(f"Verifying payment for user: {user_email}")
-        print(f"Verification data: {data}")
+        app.logger.info(f"Verifying payment for user: {user_email}")
+        
+        if not data or not all(k in data for k in ['payment_id', 'order_id', 'signature']):
+            return jsonify({'error': 'Missing required payment information'}), 400
         
         # Verify payment signature
         if not payment.verify_payment(
@@ -1076,21 +1198,29 @@ def verify_subscription():
             data['order_id'],
             data['signature']
         ):
+            app.logger.warning(f"Invalid payment signature for user {user_email}")
             return jsonify({'error': 'Invalid payment signature'}), 400
             
         # Get payment details
         payment_details = payment.get_payment_details(data['payment_id'])
         if not payment_details['success']:
+            app.logger.error(f"Failed to fetch payment details: {payment_details.get('error')}")
             return jsonify({'error': 'Failed to fetch payment details'}), 400
             
-        # Update user subscription
+        # Get user's current state before updating
+        user = db.get_user(user_email)
+        was_expired = user and user.get('subscription', {}).get('status') == 'expired'
+        
+        # Calculate new expiry date (30 days from now)
         expiry_date = datetime.utcnow() + timedelta(days=30)
+        
+        # Update user subscription status
         update_data = {
             'is_premium': True,
             'subscription': {
                 'status': 'active',
                 'expiry': expiry_date,
-                'payment_history': [{
+                'payment_history': user.get('subscription', {}).get('payment_history', []) + [{
                     'payment_id': data['payment_id'],
                     'amount': payment_details['payment']['amount'] / 100,
                     'timestamp': datetime.utcnow()
@@ -1100,21 +1230,55 @@ def verify_subscription():
         
         result = db.update_user(user_email, update_data)
         if result.get('error'):
+            app.logger.error(f"Failed to update user subscription: {result.get('error')}")
             return jsonify({'error': result['error']}), 400
+        
+        # Get hidden universities count before making them visible
+        visibility_before = db.get_university_visibility_stats(user_email)
+        hidden_count = visibility_before.get('hidden_count', 0)
+        
+        # Unhide all universities since user is now premium
+        visibility_result = db.update_user_university_visibility(user_email, True)
+        app.logger.info(f"Updated university visibility result: {visibility_result}")
+        
+        # If user was previously expired and had hidden universities,
+        # process any pending columns for those universities
+        if was_expired and hidden_count > 0:
+            app.logger.info(f"Scheduling processing of pending columns for {hidden_count} previously hidden universities")
             
+            # Queue the background task to process pending columns
+            try:
+                task = process_pending_columns_task.delay(user_email=user_email)
+                task_id = task.id
+                app.logger.info(f"Started pending columns processing task: {task_id}")
+            except Exception as task_error:
+                app.logger.error(f"Error starting background task: {str(task_error)}")
+                task_id = None
+                
+            return jsonify({
+                'success': True,
+                'message': 'Subscription activated successfully',
+                'universities_unhidden': hidden_count,
+                'pending_columns_task_id': task_id
+            })
+        
         return jsonify({
             'success': True,
-            'message': 'Subscription activated successfully'
+            'message': 'Subscription activated successfully',
+            'universities_unhidden': hidden_count
         })
         
     except Exception as e:
-        print(f"Error verifying subscription: {str(e)}")
+        app.logger.error(f"Error verifying subscription: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-# Add this function to your app.py
 @app.route('/api/subscription/status', methods=['GET'])
 @jwt_required()
 def check_subscription_status():
+    """
+    Check and update subscription status, handling university visibility accordingly.
+    When a subscription expires, this hides universities beyond the free tier limit.
+    """
     try:
         user_email = get_jwt_identity()
         user = db.get_user(user_email)
@@ -1126,32 +1290,57 @@ def check_subscription_status():
         if user.get('subscription'):
             expiry = user['subscription'].get('expiry')
             if expiry:
-                # MongoDB returns datetime, ensure it's UTC
-                expiry_date = expiry.replace(tzinfo=timezone.utc) if isinstance(expiry, datetime) else datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+                # Ensure date is in UTC format
+                if isinstance(expiry, datetime):
+                    expiry_date = expiry.replace(tzinfo=timezone.utc)
+                else:
+                    # Parse string date to datetime with timezone
+                    expiry_date = datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+                    
                 current_time = datetime.now(timezone.utc)
 
+                # Check if subscription has expired
                 if current_time > expiry_date:
+                    app.logger.info(f"Subscription expired for user {user_email}")
+                    
                     # Update user status to expired
                     db.update_user(user_email, {
                         'is_premium': False,
                         'subscription': {
                             'status': 'expired',
                             'expiry': expiry,
-                            'paymentHistory': user['subscription'].get('paymentHistory', [])
+                            'payment_history': user['subscription'].get('payment_history', [])
                         }
                     })
+                    
+                    # Hide universities beyond the free limit (only first 3 remain visible)
+                    visibility_result = db.update_user_university_visibility(user_email, False)
+                    app.logger.info(f"Updated university visibility: {visibility_result}")
+                    
                     return jsonify({
                         'is_premium': False,
                         'subscription': {
                             'status': 'expired',
                             'expiry': expiry.isoformat() if isinstance(expiry, datetime) else expiry
-                        }
+                        },
+                        'visibility_updated': True
                     })
+                else:
+                    # Subscription still active, make sure all universities are visible
+                    db.update_user_university_visibility(user_email, True)
 
-        # Return current status if not expired
+        # Get latest visibility data
+        visibility_data = db.get_university_visibility_stats(user_email)
+        
+        # Return current status
         return jsonify({
             'is_premium': user.get('is_premium', False),
-            'subscription': user.get('subscription', {'status': 'free'})
+            'subscription': user.get('subscription', {'status': 'free'}),
+            'visibility': {
+                'total_universities': visibility_data.get('total_count', 0),
+                'visible_universities': visibility_data.get('visible_count', 0),
+                'hidden_universities': visibility_data.get('hidden_count', 0)
+            }
         })
         
     except Exception as e:
@@ -1319,6 +1508,32 @@ def get_batch_status():
         return jsonify(statuses)
     except Exception as e:
         app.logger.error(f"Error getting batch status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/users/universities/visibility', methods=['GET'])
+@jwt_required()
+def get_university_visibility():
+    try:
+        user_email = get_jwt_identity()
+        
+        # Get visibility statistics
+        visibility_stats = db.get_university_visibility_stats(user_email)
+        
+        # Get user's subscription status
+        user = db.get_user(user_email)
+        is_premium = user.get('is_premium', False)
+        is_expired = user.get('subscription', {}).get('status') == 'expired'
+        
+        return jsonify({
+            'total_count': visibility_stats.get('total_count', 0),
+            'visible_count': visibility_stats.get('visible_count', 0),
+            'hidden_count': visibility_stats.get('hidden_count', 0),
+            'is_premium': is_premium,
+            'is_expired': is_expired
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error getting university visibility: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.errorhandler(500)
