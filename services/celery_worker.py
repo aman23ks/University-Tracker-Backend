@@ -10,6 +10,7 @@ from services.database import MongoDB
 from services.rag_retrieval import RAGRetrieval
 from functools import wraps
 from services.redis_fix import get_redis_connection
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -305,6 +306,8 @@ def process_column_task(university_id: str, column: dict, namespace: str, user_e
         logger.error(f"Error processing column task: {str(e)}")
         return False
 
+# This is a partial update for process_custom_columns_task in celery_worker.py
+
 @celery.task(bind=True, name='services.celery_worker.process_custom_columns')
 def process_custom_columns_task(self, university_id: str, namespace: str, user_email: str = None, url: str = None, program: str = None):
     logger.info(f"Starting column processing for university {university_id}")
@@ -349,7 +352,7 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
             }
         })
         
-        batch_size = 5
+        batch_size = 3  # Process in smaller batches for better UX feedback
         for i in range(0, len(columns), batch_size):
             batch = columns[i:i + batch_size]
             
@@ -364,24 +367,76 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
                     if existing_data:
                         processed += 1
                         logger.info(f"Column {column.get('name')} already processed")
+                        
+                        # Send the existing data to the client for immediate display
+                        from services.event_handler import publish_cell_update
+                        publish_cell_update(
+                            university_id=university_id,
+                            column_id=str(column['_id']),
+                            value=rag_result['answer'],
+                            user_email=user_email
+                        )
+                        time.sleep(0.05)
                         continue
                         
-                    success = process_column_task(
-                        university_id=university_id,
-                        column=column,
-                        namespace=namespace,
-                        user_email=user_email
-                    )
+                    # Process the column
+                    column_id = str(column.get('_id', ''))
+                    question = f"What is the {column['name']} requirement or information for this university program?"
                     
-                    if success:
-                        processed += 1
-                        logger.info(f"Successfully processed column {column.get('name')}")
-                    
+                    # Run async RAG query in synchronous context
+                    try:
+                        rag_result = run_async(rag.query(question, namespace))
+                        if not rag_result or 'answer' not in rag_result:
+                            logger.error(f"No RAG result for column {column['name']}")
+                            continue
+                            
+                        if user_email:
+                            # Save to database
+                            result = db.save_column_data({
+                                'university_id': university_id,
+                                'column_id': column_id,
+                                'user_email': user_email,
+                                'value': rag_result['answer']
+                            })
+                            
+                            logger.info(f"Saved column data for user {user_email}")
+                            
+                            # Send real-time update for this specific cell
+                            from services.event_handler import publish_cell_update
+                            publish_cell_update(
+                                university_id=university_id,
+                                column_id=column_id,
+                                value=rag_result['answer'],
+                                user_email=user_email
+                            )
+                            
+                            processed += 1
+                        
+                    except Exception as e:
+                        logger.error(f"RAG query error: {str(e)}")
+                        if user_email:
+                            value = "Error processing data"
+                            db.save_column_data({
+                                'university_id': university_id,
+                                'column_id': column_id,
+                                'user_email': user_email,
+                                'value': value
+                            })
+                            
+                            # Still send update to client with error message
+                            from services.event_handler import publish_cell_update
+                            publish_cell_update(
+                                university_id=university_id,
+                                column_id=column_id,
+                                value=value,
+                                user_email=user_email
+                            )
+                            
                 except Exception as e:
                     logger.error(f"Error processing column {column.get('name')}: {str(e)}")
                     continue
             
-            # Update progress in Redis and publish update
+            # Update progress in Redis 
             redis_client.hset(
                 progress_key,
                 mapping={
@@ -391,6 +446,7 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
                 }
             )
             
+            # Send overall progress update (less frequently)
             publish_status_update(university_id, 'processing', {
                 'url': url,
                 'program': program,
@@ -400,6 +456,9 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
                     'processed': processed
                 }
             })
+            
+            # Add a small delay between batches for better UX
+            time.sleep(0.2)
         
         redis_client.hset(
             progress_key,
@@ -440,7 +499,7 @@ def process_custom_columns_task(self, university_id: str, namespace: str, user_e
             'error': str(e)
         })
         return False
-
+    
 @celery.task(name='services.celery_worker.cleanup_stale_tasks')
 def cleanup_stale_tasks():
     try:
@@ -475,4 +534,175 @@ def cleanup_stale_tasks():
         
     except Exception as e:
         logger.error(f"Error in cleanup task: {str(e)}")
+        return {'error': str(e)}
+
+@celery.task(bind=True, name='services.celery_worker.process_pending_columns')
+def process_pending_columns_task(self, user_email: str):
+    """Process columns added during subscription expiry for newly visible universities"""
+    logger.info(f"Processing pending columns for user: {user_email}")
+    
+    try:
+        # Get user information
+        user = db.get_user(user_email)
+        if not user:
+            logger.error(f"User not found: {user_email}")
+            return {'error': 'User not found'}
+            
+        # Get pending columns
+        pending_columns = db.get_pending_columns(user_email)
+        logger.info(f"Found {len(pending_columns)} pending columns")
+        
+        if not pending_columns:
+            logger.info("No pending columns to process")
+            return {'success': True, 'message': 'No pending columns to process'}
+        
+        # Get all university IDs for this user
+        selected_urls = user.get('selected_universities', [])
+        all_universities = db.get_universities_by_urls(selected_urls)
+        
+        # Get all universities beyond the first 3 (these were previously hidden)
+        previously_hidden_universities = all_universities[3:] if len(all_universities) > 3 else []
+        previously_hidden_ids = [uni.get('id', str(uni['_id'])) for uni in previously_hidden_universities]
+        
+        logger.info(f"Found {len(previously_hidden_ids)} previously hidden universities")
+        
+        if not previously_hidden_ids:
+            logger.info("No hidden universities to process")
+            db.mark_pending_columns_processed(user_email)  # Mark all as processed anyway
+            return {'success': True, 'message': 'No hidden universities to process'}
+            
+        # Send initial notification with detailed information
+        from services.event_handler import publish_user_update
+        publish_user_update(user_email, 'processing_started', {
+            'hidden_universities_count': len(previously_hidden_ids),
+            'pending_columns_count': len(pending_columns),
+            'university_ids': previously_hidden_ids,  # Include university IDs for client-side loading
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+        # Wait a short moment to ensure the client has time to initialize loading states
+        time.sleep(0.5)
+        
+        # Process universities in smaller batches (2-3 at a time) with delays between batches
+        batch_size = 2
+        processed_count = 0
+        
+        # Process in batches
+        for i in range(0, len(previously_hidden_ids), batch_size):
+            batch_universities = previously_hidden_ids[i:i+batch_size]
+            
+            # Process each university in the batch
+            for university_id in batch_universities:
+                # Track processed columns for this university
+                processed_columns = []
+                
+                # Process all columns for this university
+                # Process all columns for this university
+                for column in pending_columns:
+                    try:
+                        # Create namespace for RAG query
+                        namespace = f"uni_{university_id}"
+                        
+                        # Process column using RAG
+                        question = f"What is the {column['name']} requirement or information for this university program?"
+                        
+                        # Run async RAG query in synchronous context
+                        rag_result = run_async(rag.query(question, namespace))
+                        
+                        if rag_result and 'answer' in rag_result:
+                            # First save to database
+                            value = rag_result['answer']
+                            db.save_column_data({
+                                'university_id': university_id,
+                                'column_id': column['column_id'],
+                                'user_email': user_email,
+                                'value': value
+                            })
+                            processed_count += 1
+                            
+                            # Then immediately publish a separate event for this cell
+                            from services.event_handler import publish_cell_update
+                            publish_cell_update(
+                                university_id=university_id,
+                                column_id=column['column_id'],
+                                value=value,
+                                user_email=user_email
+                            )
+                            
+                            # Add to processed columns list
+                            processed_columns.append(column['column_id'])
+                            logger.info(f"Successfully processed column {column['name']} for university {university_id}")
+                            
+                            # IMPORTANT: Add a small delay between cell updates
+                            # This prevents network congestion and race conditions
+                            time.sleep(0.15)
+                            
+                        else:
+                            logger.warning(f"No RAG result for column {column['name']} and university {university_id}")
+                            
+                            # Still send a failure notification so the UI can update
+                            from services.event_handler import publish_cell_update
+                            publish_cell_update(
+                                university_id=university_id,
+                                column_id=column['column_id'],
+                                value="No information available",
+                                user_email=user_email
+                            )
+                            
+                            # Small delay even after error updates
+                            time.sleep(0.1)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing column {column['name']} for university {university_id}: {str(e)}")
+                        
+                        # Send error notification
+                        try:
+                            from services.event_handler import publish_cell_update
+                            publish_cell_update(
+                                university_id=university_id,
+                                column_id=column['column_id'],
+                                value="Error processing data",
+                                user_email=user_email
+                            )
+                        except Exception as publish_error:
+                            logger.error(f"Error publishing cell update: {str(publish_error)}")
+                        
+                        # Small delay after error
+                        time.sleep(0.1)
+                        continue
+                # Small delay between universities
+                time.sleep(0.3)
+            
+            # Slightly longer delay between batches
+            time.sleep(0.5)
+        
+        # Mark all pending columns as processed
+        db.mark_pending_columns_processed(user_email)
+        
+        logger.info(f"Completed processing {processed_count} column-university combinations")
+        
+        # IMPORTANT: The final completion event should come AFTER all individual cell updates
+        # Add this small delay to ensure cell updates are processed first
+        time.sleep(1)
+        
+        # Emit a single final event when all processing is complete
+        try:
+            from services.event_handler import publish_user_update
+            publish_user_update(user_email, 'subscription_reactivated', {
+                'hidden_universities_processed': len(previously_hidden_ids),
+                'columns_processed': len(pending_columns),
+                'university_ids': previously_hidden_ids,  # Include university IDs for reference
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        except Exception as socket_error:
+            logger.error(f"Error sending final user update: {str(socket_error)}")
+        
+        return {
+            'success': True,
+            'processed_count': processed_count,
+            'universities_processed': len(previously_hidden_ids)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing pending columns: {str(e)}")
         return {'error': str(e)}
