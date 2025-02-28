@@ -111,7 +111,7 @@ def store_progress(university_id: str, status: dict, ttl: int = 3600):
         logger.error(f"Error storing progress: {str(e)}")
 
 @celery.task(bind=True, name='services.celery_worker.process_university_background')
-def process_university_background(self, url: str, program: str, university_id: str, url_limit: int = 15, email=None):
+def process_university_background(self, url: str, program: str, university_id: str, url_limit: int = None, email=None):
     logger.info(f"Starting processing for university {university_id} with URL: {url}")
     
     try:
