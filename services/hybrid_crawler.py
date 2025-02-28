@@ -433,7 +433,7 @@ class HybridCrawler:
 
         return self.extracted_data
 
-    def chunk_text(self, text: str, chunk_size: int = 1000) -> List[str]:
+    def chunk_text(self, text: str, chunk_size: int = 10000) -> List[str]:
         """Optimized text chunking with better sentence handling"""
         chunks = []
         
