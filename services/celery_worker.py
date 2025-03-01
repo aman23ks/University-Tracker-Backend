@@ -52,15 +52,15 @@ celery.conf.update(
     result_serializer='json',
     timezone='UTC',
     enable_utc=True,
-    task_time_limit=7200,
-    task_soft_time_limit=6900,
+    task_time_limit=None,
+    task_soft_time_limit=None,
     worker_max_tasks_per_child=5,
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     broker_connection_retry_on_startup=True,
     task_track_started=True,
-    broker_transport_options={'visibility_timeout': 43200},
+    broker_transport_options={'visibility_timeout': 86400*7},
     redis_max_connections=20,
     worker_concurrency=2
 )
@@ -111,7 +111,7 @@ def store_progress(university_id: str, status: dict, ttl: int = 3600):
         logger.error(f"Error storing progress: {str(e)}")
 
 @celery.task(bind=True, name='services.celery_worker.process_university_background')
-def process_university_background(self, url: str, program: str, university_id: str, url_limit: int = None, email=None):
+def process_university_background(self, url: str, program: str, university_id: str, url_limit: int = 15, email=None):
     logger.info(f"Starting processing for university {university_id} with URL: {url}")
     
     try:

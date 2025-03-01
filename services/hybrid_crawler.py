@@ -16,6 +16,9 @@ import cachetools
 import time
 import os
 import redis
+import xml.etree.ElementTree as ET
+import gzip
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,7 @@ class HybridCrawler:
     def __init__(self, openai_api_key: str, pinecone_api_key: str, index_name: str):
         self.visited_urls: Set[str] = set()
         self.urls_to_visit: deque = deque()
+        self.sitemap_urls: Set[str] = set()  # New: Store sitemap URLs separately
         self.extracted_data: List[Dict] = []
         self.client = OpenAI(api_key=openai_api_key)
         self.pc = Pinecone(api_key=pinecone_api_key)
@@ -39,8 +43,8 @@ class HybridCrawler:
         self.pinecone_api_key = pinecone_api_key
         self.index_name = index_name
         
-        # Memory-efficient caching with shorter TTL
-        self.embedding_cache = cachetools.TTLCache(maxsize=500, ttl=1800)
+        # Memory-efficient caching with longer TTL
+        self.embedding_cache = cachetools.TTLCache(maxsize=1000, ttl=3600)
         
         # Production-optimized headers
         self.headers = {
@@ -53,37 +57,169 @@ class HybridCrawler:
         }
         
         # Production-optimized limits
-        self.batch_size = 10  # Process 10 URLs per batch
-        self.concurrent_requests = 3  # Reduced concurrent requests
-        self.timeout = 8  # 8-second timeout (within serverless limits)
-        self.min_request_interval = 0.1  # Faster requests
+        self.batch_size = 20  # Increased to process more URLs per batch
+        self.concurrent_requests = 15  # Increased concurrency
+        self.timeout = 15  # Longer timeout for complex pages
+        self.min_request_interval = 0.05  # Faster requests
         self.max_retries = 3  # Retry failed requests
         
+        # Less restrictive URL filtering for better coverage
         self.ignore_patterns = re.compile(
-            r'\.(css|js|jpg|jpeg|png|gif|pdf|zip|ico|xml)$|'
-            r'(login|logout|signup|signin|register|auth|'
-            r'calendar|events|news|blog|'
-            r'download|uploads|assets|static|'
-            r'search|tags|categories)',
+            r'\.(css|js|jpg|jpeg|png|gif|pdf|zip|ico|svg)$|'
+            r'(login|logout|signup|signin|register|auth)',
             re.IGNORECASE
         )
+        
+        # Stats tracking
+        self.stats = {
+            'pages_crawled': 0,
+            'pages_extracted': 0,
+            'sitemap_urls_found': 0
+        }
+        
+        # IMPORTANT: Override any URL limit to ensure ALL pages are crawled
+        self.enforce_url_limit = False
 
     async def initialize_crawl(self, root_url: str, program: str, university_id: str):
-        """Initialize crawling with efficient data structures"""
+        """Initialize crawling with sitemap discovery"""
         self.root_domain = urlparse(root_url).netloc
+        self.scheme = urlparse(root_url).scheme
         self.program = program
         self.university_id = university_id
-        self.urls_to_visit = deque([root_url])
+        
+        # Clear data structures
         self.visited_urls.clear()
+        self.urls_to_visit.clear()
+        self.sitemap_urls.clear()
         self.extracted_data.clear()
+        
+        # Reset stats
+        self.stats = {
+            'pages_crawled': 0,
+            'pages_extracted': 0,
+            'sitemap_urls_found': 0
+        }
+        
+        # Try to discover sitemaps first
+        await self.discover_sitemaps()
+        
+        # Add all sitemap URLs to the queue
+        if self.sitemap_urls:
+            for url in self.sitemap_urls:
+                if url not in self.urls_to_visit:
+                    self.urls_to_visit.append(url)
+        
+        # Add root URL if queue is empty
+        if not self.urls_to_visit:
+            self.urls_to_visit.append(root_url)
         
         # Initialize progress in Redis
         await self.update_progress({
             'status': 'initializing',
-            'total_urls': 1,
+            'total_urls': len(self.urls_to_visit),
             'processed_urls': 0,
-            'current_batch': 0
+            'current_batch': 0,
+            'sitemap_urls': len(self.sitemap_urls)
         })
+
+    async def discover_sitemaps(self):
+        """Find and process sitemap files"""
+        base_url = f"{self.scheme}://{self.root_domain}"
+        sitemap_paths = [
+            '/sitemap.xml',
+            '/sitemap_index.xml',
+            '/sitemap.php',
+            '/sitemap/',
+            '/sitemaps/',
+            '/sitemap.gz',
+            '/sitemap.xml.gz',
+            '/robots.txt'  # Check robots.txt for sitemap directives
+        ]
+        
+        logger.info(f"Looking for sitemaps at {self.root_domain}")
+        
+        async with aiohttp.ClientSession() as session:
+            # First try robots.txt to find sitemaps
+            try:
+                async with session.get(f"{base_url}/robots.txt", headers=self.headers, timeout=10) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        # Parse sitemap URLs from robots.txt
+                        sitemap_matches = re.findall(r'Sitemap:\s*(https?://[^\s]+)', text, re.IGNORECASE)
+                        for sitemap_url in sitemap_matches:
+                            await self.process_sitemap(session, sitemap_url.strip())
+            except Exception as e:
+                logger.warning(f"Error checking robots.txt: {str(e)}")
+            
+            # Check common sitemap locations
+            for path in sitemap_paths:
+                if path == '/robots.txt':  # Already checked
+                    continue
+                    
+                try:
+                    sitemap_url = f"{base_url}{path}"
+                    logger.info(f"Checking sitemap at {sitemap_url}")
+                    await self.process_sitemap(session, sitemap_url)
+                except Exception as e:
+                    logger.warning(f"Error checking sitemap at {path}: {str(e)}")
+
+    async def process_sitemap(self, session, sitemap_url):
+        """Process a sitemap XML file"""
+        try:
+            async with session.get(sitemap_url, headers=self.headers, timeout=15) as response:
+                if response.status != 200:
+                    return
+                
+                # Check for gzipped content
+                content_type = response.headers.get('Content-Type', '')
+                is_gzipped = 'gzip' in content_type or sitemap_url.endswith('.gz')
+                
+                if is_gzipped:
+                    # Handle gzipped content
+                    content_bytes = await response.read()
+                    with gzip.GzipFile(fileobj=BytesIO(content_bytes), mode='rb') as f:
+                        sitemap_content = f.read().decode('utf-8')
+                else:
+                    # Normal content
+                    sitemap_content = await response.text()
+                
+                # Process sitemap index (collection of sitemaps)
+                if '<sitemapindex' in sitemap_content:
+                    logger.info(f"Found sitemap index at {sitemap_url}")
+                    try:
+                        root = ET.fromstring(sitemap_content)
+                        # Process each sitemap in the index
+                        for sitemap in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}sitemap'):
+                            loc = sitemap.find('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')
+                            if loc is not None and loc.text:
+                                child_sitemap = loc.text.strip()
+                                await self.process_sitemap(session, child_sitemap)
+                    except ET.ParseError:
+                        logger.warning(f"XML parsing error in sitemap index: {sitemap_url}")
+                
+                # Process regular sitemap with URLs
+                elif '<urlset' in sitemap_content:
+                    logger.info(f"Processing sitemap at {sitemap_url}")
+                    try:
+                        root = ET.fromstring(sitemap_content)
+                        # Extract all URLs
+                        count = 0
+                        for url in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}url'):
+                            loc = url.find('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')
+                            if loc is not None and loc.text:
+                                page_url = loc.text.strip()
+                                # Filter URLs by domain and patterns
+                                if self.root_domain in urlparse(page_url).netloc and not self.ignore_patterns.search(page_url):
+                                    self.sitemap_urls.add(page_url)
+                                    count += 1
+                        
+                        logger.info(f"Added {count} URLs from sitemap {sitemap_url}")
+                        self.stats['sitemap_urls_found'] += count
+                    except ET.ParseError:
+                        logger.warning(f"XML parsing error in sitemap: {sitemap_url}")
+        
+        except Exception as e:
+            logger.error(f"Error processing sitemap {sitemap_url}: {str(e)}")
 
     def is_valid_url(self, url: str) -> bool:
         """Improved URL validation"""
@@ -103,7 +239,7 @@ class HybridCrawler:
                 return False
                 
             # Skip ignored patterns
-            if self.ignore_patterns.search(parsed.path.lower()):
+            if self.ignore_patterns.search(url):
                 return False
                 
             # Skip URLs that are too long
@@ -145,13 +281,24 @@ class HybridCrawler:
             return text
 
     async def extract_all_links(self, html: str, base_url: str) -> Set[str]:
-        """Fast link extraction with focused parsing"""
+        """Enhanced link extraction for better coverage"""
         links = set()
         try:
             # Use lxml parser for speed
             soup = BeautifulSoup(html, 'lxml')
             
-            # Look for all content areas, not just main
+            # First, get links from navigation elements (high priority)
+            for nav in soup.find_all(['nav', 'header', 'menu']):
+                for link in nav.find_all('a', href=True):
+                    href = link.get('href')
+                    if not href:
+                        continue
+                    
+                    url = urljoin(base_url, href)
+                    if self.is_valid_url(url):
+                        links.add(url)
+            
+            # Then process all content areas
             content_areas = soup.find_all(['main', 'article', 'div', 'section'])
             
             for area in content_areas:
@@ -166,6 +313,16 @@ class HybridCrawler:
                     # Validate URL
                     if self.is_valid_url(url):
                         links.add(url)
+            
+            # Finally, check all remaining links in the page
+            for link in soup.find_all('a', href=True):
+                href = link.get('href')
+                if not href:
+                    continue
+                
+                url = urljoin(base_url, href)
+                if self.is_valid_url(url):
+                    links.add(url)
                 
             return links
 
@@ -184,26 +341,56 @@ class HybridCrawler:
                 include_tables=True,
                 target_language=None,
                 deduplicate=True,
+                favor_recall=True  # Extract more content
             )
             
             # Fallback to BeautifulSoup
-            if not extracted_text:
+            if not extracted_text or len(extracted_text.strip()) < 100:
                 soup = BeautifulSoup(html_content, 'lxml')
-                main_content = soup.find(['main', 'article', 'div', 'section'])
+                
+                # Remove noise elements
+                for tag in soup.find_all(['script', 'style', 'iframe']):
+                    tag.decompose()
+                
+                # Try to find main content
+                main_content = None
+                for selector in ['main', 'article', '#content', '.content', '#main', '.main']:
+                    found = soup.select(selector)
+                    if found:
+                        main_content = found[0]
+                        break
+                
+                # If no main content, use body
+                if not main_content:
+                    main_content = soup.body
+                
                 if main_content:
-                    paragraphs = main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-                    extracted_text = ' '.join([p.get_text(strip=True) for p in paragraphs])
+                    # Get all text elements
+                    paragraphs = main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'td', 'div'])
+                    extracted_text = ' '.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20])
                     
             if extracted_text:
                 # Clean and normalize text
                 cleaned_text = ' '.join(extracted_text.split())
                 if len(cleaned_text.split()) > 50:  # Only keep if meaningful content
                     logger.info(f"Successfully extracted {len(cleaned_text.split())} words from {url}")
+                    self.stats['pages_extracted'] += 1
+                    
+                    # Get page title
+                    title = ""
+                    try:
+                        soup = BeautifulSoup(html_content, 'lxml')
+                        if soup.title:
+                            title = soup.title.string.strip()
+                    except:
+                        pass
+                    
                     return {
                         'url': url,
                         'content': cleaned_text,
                         'metadata': {
                             'program': self.program,
+                            'title': title,
                             'timestamp': datetime.utcnow().isoformat()
                         }
                     }
@@ -214,52 +401,14 @@ class HybridCrawler:
         except Exception as e:
             logger.error(f"Error processing content from {url}: {str(e)}")
             return None
-    
-    async def verify_stored_data(self, university_id: str = None) -> Dict:
-        """Verify data stored in Pinecone by checking sample vectors"""
-        try:
-            namespace = f"uni_{university_id}"
-            print(f"Verifying data storage in namespace: {namespace}")
-            
-            # Check if we have the last store result
-            if hasattr(self, '_last_store_result') and self._last_store_result['namespace'] == namespace:
-                stored_count = self._last_store_result['stored_count']
-                vector_ids = self._last_store_result['vector_ids']
-                
-                if stored_count > 0 and vector_ids:
-                    # Verify a sample vector exists
-                    try:
-                        sample_id = vector_ids[0]
-                        fetch_response = self.index.fetch(ids=[sample_id], namespace=namespace)
-                        
-                        if fetch_response and fetch_response.vectors:
-                            print(f"Successfully verified data storage. Found {stored_count} vectors")
-                            return {
-                                'success': True,
-                                'vector_count': stored_count,
-                                'namespace': namespace
-                            }
-                    except Exception as e:
-                        print(f"Error fetching sample vector: {str(e)}")
-            
-            print("No stored data found or verification failed")
-            return {
-                'success': True,
-                'vector_count': 0,
-                'namespace': namespace
-            }
-            
-        except Exception as e:
-            print(f"Error verifying data: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e)
-            }
 
     async def crawl_url(self, session: aiohttp.ClientSession, url: str) -> None:
-        """Improved URL crawling with better link handling"""
+        """Improved URL crawling with better error handling"""
         if url in self.visited_urls:
             return
+            
+        # Mark as visited before processing to avoid duplicates
+        self.visited_urls.add(url)
             
         for attempt in range(self.max_retries):
             try:
@@ -267,9 +416,15 @@ class HybridCrawler:
                     url, 
                     headers=self.headers,
                     timeout=self.timeout,
-                    ssl=False
+                    ssl=False,
+                    allow_redirects=True
                 ) as response:
                     if response.status == 200:
+                        # Check if it's HTML content
+                        content_type = response.headers.get('Content-Type', '')
+                        if 'text/html' not in content_type and 'application/xhtml+xml' not in content_type:
+                            return
+                            
                         html = await response.text()
                         
                         # Process content first
@@ -279,55 +434,84 @@ class HybridCrawler:
                         
                         # Extract and queue new links
                         new_links = await self.extract_all_links(html, url)
+                        
+                        # Add new links to the queue if not already visited
                         for new_url in new_links:
                             if new_url not in self.visited_urls and new_url not in self.urls_to_visit:
                                 self.urls_to_visit.append(new_url)
                         
+                        # Update stats
+                        self.stats['pages_crawled'] += 1
                         break
                     
-                    elif response.status in [403, 404, 410]:
+                    elif response.status in [301, 302, 303, 307, 308]:
+                        # Handle redirects
+                        redirect_url = response.headers.get('Location')
+                        if redirect_url:
+                            absolute_url = urljoin(url, redirect_url)
+                            if self.is_valid_url(absolute_url) and absolute_url not in self.visited_urls:
+                                self.urls_to_visit.append(absolute_url)
                         break
                     
+                    elif response.status in [403, 404, 410, 429, 500, 503]:
+                        # Don't retry for these status codes
+                        break
+                    
+            except asyncio.TimeoutError:
+                if attempt == self.max_retries - 1:
+                    logger.error(f"Timeout on {url} after {self.max_retries} attempts")
+                await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+                continue
+                
             except Exception as e:
                 if attempt == self.max_retries - 1:
                     logger.error(f"Error crawling {url}: {str(e)}")
-                await asyncio.sleep(0.5 * (attempt + 1))
+                await asyncio.sleep(1 * (attempt + 1))
                 continue
-                    
-        self.visited_urls.add(url)
 
     async def crawl(self, progress_callback=None, url_limit: int = None) -> Dict:
-        """Main crawling logic with batched processing and optional URL limit for testing"""
-        print("Starting crawl with URL limit:", url_limit)
+        """Enhanced crawling with no actual URL limit to ensure ALL pages are crawled"""
+        actual_limit = None  # IMPORTANT: We're ignoring url_limit to crawl everything
+        
+        # Only log the original URL limit for debugging, but we won't use it
+        print(f"Starting crawl with URL limit: {url_limit or 'unlimited'} (Actual: unlimited)")
+        
         try:
             stored_count = 0
             batch_size = 50  # Process in batches of 50
-            current_batch = []
             processed_urls = 0
+            total_urls_found = len(self.urls_to_visit) + len(self.sitemap_urls)
+            
+            print(f"Total URLs to process: {total_urls_found}")
+            
+            # Start with sitemap URLs if found
+            if self.sitemap_urls:
+                print(f"Processing ALL {len(self.sitemap_urls)} URLs from sitemap")
             
             connector = aiohttp.TCPConnector(limit=self.concurrent_requests, ssl=False)
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                while self.urls_to_visit and (url_limit is None or processed_urls < url_limit):
-                    print(f"Current processed URLs: {processed_urls}, URL limit: {url_limit}")
-                    
+                # Keep processing until the queue is empty - ALWAYS process ALL URLs
+                while self.urls_to_visit:
                     # Process URLs in batches
                     batch_urls = []
-                    for _ in range(min(self.batch_size, url_limit - processed_urls if url_limit else self.batch_size)):
+                    for _ in range(self.batch_size):
                         if not self.urls_to_visit:
                             break
                         url = self.urls_to_visit.popleft()
                         if url not in self.visited_urls:
                             batch_urls.append(url)
                             processed_urls += 1
-                            print(f"Added URL to batch: {url}, Processed URLs: {processed_urls}")
 
                     if not batch_urls:
-                        print("No new URLs in batch, continuing...")
                         continue
-
-                    print(f"Processing batch of {len(batch_urls)} URLs")
+                    
+                    total_now = processed_urls + len(self.urls_to_visit)
+                    if total_now > total_urls_found:
+                        total_urls_found = total_now
+                    
+                    print(f"Processing batch of {len(batch_urls)} URLs. Progress: {processed_urls}/{total_urls_found}")
                     
                     # Process batch
                     tasks = [self.crawl_url(session, url) for url in batch_urls]
@@ -337,10 +521,9 @@ class HybridCrawler:
                     if progress_callback:
                         progress_callback({
                             'processed_urls': processed_urls,
-                            'total_urls': len(self.visited_urls) + len(self.urls_to_visit),
+                            'total_urls': total_urls_found,
                             'data_chunks': stored_count
                         })
-                        print(f"Progress updated - Processed: {processed_urls}, Total: {len(self.visited_urls) + len(self.urls_to_visit)}")
 
                     # Store batch data when we have enough
                     if len(self.extracted_data) >= batch_size:
@@ -351,7 +534,18 @@ class HybridCrawler:
                         print(f"Stored {batch_count} chunks in Pinecone")
                         self.extracted_data = []  # Clear after storing
                     
-                    await asyncio.sleep(0.1)  # Prevent overload
+                    # Report progress more frequently
+                    if processed_urls % 100 == 0:
+                        print(f"Progress update: {processed_urls} URLs processed, {len(self.urls_to_visit)} URLs remaining")
+                        # Update MongoDB
+                        await self.update_progress({
+                            'status': 'processing',
+                            'processed_urls': processed_urls,
+                            'total_urls': total_urls_found,
+                            'data_chunks': stored_count
+                        })
+                    
+                    await asyncio.sleep(0.05)  # Small delay between batches
                 
                 # Store any remaining data
                 if self.extracted_data:
@@ -363,13 +557,16 @@ class HybridCrawler:
                 
                 print(f"\nCrawl Summary:")
                 print(f"Total URLs processed: {processed_urls}")
+                print(f"Total pages crawled: {self.stats['pages_crawled']}")
+                print(f"Total pages with content: {self.stats['pages_extracted']}")
                 print(f"Total data chunks stored: {stored_count}")
                 
                 return {
                     'success': True,
                     'stored_count': stored_count,
                     'processed_urls': processed_urls,
-                    'pages_crawled': len(self.visited_urls)
+                    'pages_crawled': len(self.visited_urls),
+                    'total_pages': total_urls_found
                 }
                 
         except Exception as e:
@@ -380,61 +577,32 @@ class HybridCrawler:
                 'processed_urls': processed_urls,
                 'stored_count': stored_count
             }
-        
-    async def crawl_batch(self, session: aiohttp.ClientSession) -> List[Dict]:
-        """Process a batch of URLs efficiently"""
-        batch_urls = []
-        for _ in range(self.batch_size):
-            if not self.urls_to_visit:
-                break
-            url = self.urls_to_visit.popleft()
-            if url not in self.visited_urls:
-                batch_urls.append(url)
 
-        if not batch_urls:
+    async def get_embedding_async(self, text: str) -> List[float]:
+        """Asynchronous embedding generation"""
+        # Limit text length for embedding API
+        if len(text) > 8000:
+            text = text[:8000]
+            
+        cache_key = hash(text)
+        if cache_key in self.embedding_cache:
+            return self.embedding_cache[cache_key]
+            
+        try:
+            response = await asyncio.to_thread(
+                self.client.embeddings.create,
+                model="text-embedding-ada-002",
+                input=text
+            )
+            embedding = response.data[0].embedding
+            self.embedding_cache[cache_key] = embedding
+            return embedding
+        except Exception as e:
+            logger.error(f"Error getting embedding: {str(e)}")
             return []
-
-        tasks = [self.crawl_url(session, url) for url in batch_urls]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Update progress
-        await self.update_progress({
-            'status': 'crawling',
-            'total_urls': len(self.urls_to_visit) + len(self.visited_urls),
-            'processed_urls': len(self.visited_urls),
-            'current_batch': len(self.extracted_data)
-        })
-
-        return self.extracted_data
-
-    async def crawl_batch(self, session: aiohttp.ClientSession) -> List[Dict]:
-        """Process a batch of URLs efficiently"""
-        batch_urls = []
-        for _ in range(self.batch_size):
-            if not self.urls_to_visit:
-                break
-            url = self.urls_to_visit.popleft()
-            if url not in self.visited_urls:
-                batch_urls.append(url)
-
-        if not batch_urls:
-            return []
-
-        tasks = [self.crawl_url(session, url) for url in batch_urls]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Update progress
-        await self.update_progress({
-            'status': 'crawling',
-            'total_urls': len(self.urls_to_visit) + len(self.visited_urls),
-            'processed_urls': len(self.visited_urls),
-            'current_batch': len(self.extracted_data)
-        })
-
-        return self.extracted_data
 
     def chunk_text(self, text: str, chunk_size: int = 10000) -> List[str]:
-        """Optimized text chunking with better sentence handling"""
+        """Optimized text chunking with better semantic boundaries"""
         chunks = []
         
         # First, clean the text
@@ -468,7 +636,7 @@ class HybridCrawler:
         return chunks
 
     async def store_batch_in_pinecone(self, batch_data: List[Dict], namespace: str) -> int:
-        """Store processed data in Pinecone"""
+        """Store processed data in Pinecone with better error handling"""
         try:
             vectors = []
             stored_count = 0
@@ -478,7 +646,7 @@ class HybridCrawler:
                     continue
                 
                 chunks = self.chunk_text(doc['content'])
-                print(f"Created {len(chunks)} chunks from document")
+                print(f"Created {len(chunks)} chunks from document: {doc['url']}")
                 
                 for idx, chunk in enumerate(chunks):
                     if len(chunk.split()) < 50:  # Skip very short chunks
@@ -490,12 +658,13 @@ class HybridCrawler:
                         continue
                     
                     vector = {
-                        'id': f"{doc['url']}_{idx}",
+                        'id': f"{doc['url'].replace('://', '_').replace('/', '_')}_{idx}",
                         'values': embedding,
                         'metadata': {
                             'text': chunk,
                             'url': doc['url'],
                             'program': doc.get('metadata', {}).get('program', ''),
+                            'title': doc.get('metadata', {}).get('title', ''),
                             'timestamp': datetime.utcnow().isoformat()
                         }
                     }
@@ -520,133 +689,12 @@ class HybridCrawler:
                 )
                 stored_count += len(vectors)
                 
-            await asyncio.sleep(5)  
+            await asyncio.sleep(1)  
             return stored_count
             
         except Exception as e:
             print(f"Error in store_batch_in_pinecone: {str(e)}")
             return 0
-
-    async def get_embedding_async(self, text: str) -> List[float]:
-        """Asynchronous embedding generation"""
-        cache_key = hash(text)
-        if cache_key in self.embedding_cache:
-            return self.embedding_cache[cache_key]
-            
-        try:
-            response = await asyncio.to_thread(
-                self.client.embeddings.create,
-                model="text-embedding-ada-002",
-                input=text
-            )
-            embedding = response.data[0].embedding
-            self.embedding_cache[cache_key] = embedding
-            return embedding
-        except Exception as e:
-            logger.error(f"Error getting embedding: {str(e)}")
-            return []
-
-    async def store_in_pinecone(self, data: List[Dict], namespace: str) -> int:
-        """Store processed data in Pinecone with better error handling and retries"""
-        vectors = []
-        stored_count = 0
-        batch_size = 25  # Reduced batch size
-        max_retries = 3
-
-        # Process documents and create vectors
-        try:
-            with ThreadPoolExecutor() as executor:
-                for doc in data:
-                    if not doc.get('content'):
-                        continue
-                        
-                    chunks = self.chunk_text(doc['content'])
-                    chunk_futures = []
-                    
-                    for chunk in chunks:
-                        if len(chunk.split()) < 20:  # Skip very short chunks
-                            continue
-                        future = executor.submit(self.get_embedding, chunk)
-                        chunk_futures.append((chunk, future))
-
-                    for idx, (chunk, future) in enumerate(chunk_futures):
-                        try:
-                            embedding = future.result()
-                            if not embedding:
-                                continue
-                                
-                            vector = {
-                                'id': f"{doc['url']}_{idx}",
-                                'values': embedding,
-                                'metadata': {
-                                    'text': chunk,
-                                    'url': doc['url'],
-                                    'program': doc['metadata'].get('program', ''),
-                                    'timestamp': doc['metadata'].get('timestamp', ''),
-                                    'chunk_index': idx
-                                }
-                            }
-                            vectors.append(vector)
-                            
-                            # Batch upsert with retries
-                            if len(vectors) >= batch_size:
-                                for attempt in range(max_retries):
-                                    try:
-                                        # Convert vectors to proper format
-                                        upsert_vectors = [{
-                                            'id': v['id'],
-                                            'values': v['values'],
-                                            'metadata': v['metadata']
-                                        } for v in vectors]
-                                        
-                                        # Upsert to Pinecone
-                                        result = self.index.upsert(
-                                            vectors=upsert_vectors,
-                                            namespace=namespace
-                                        )
-                                        stored_count += len(vectors)
-                                        vectors = []
-                                        logger.info(f"Successfully upserted {len(upsert_vectors)} vectors")
-                                        break
-                                    except Exception as e:
-                                        if attempt == max_retries - 1:
-                                            logger.error(f"Failed to upsert vectors after {max_retries} attempts: {str(e)}")
-                                        await asyncio.sleep(1)  # Wait before retry
-                                        continue
-                        except Exception as e:
-                            logger.error(f"Error processing chunk: {str(e)}")
-                            continue
-
-            # Handle remaining vectors
-            if vectors:
-                for attempt in range(max_retries):
-                    try:
-                        # Convert remaining vectors to proper format
-                        upsert_vectors = [{
-                            'id': v['id'],
-                            'values': v['values'],
-                            'metadata': v['metadata']
-                        } for v in vectors]
-                        
-                        # Final upsert
-                        result = self.index.upsert(
-                            vectors=upsert_vectors,
-                            namespace=namespace
-                        )
-                        stored_count += len(vectors)
-                        logger.info(f"Successfully upserted final {len(upsert_vectors)} vectors")
-                        break
-                    except Exception as e:
-                        if attempt == max_retries - 1:
-                            logger.error(f"Failed to upsert final vectors after {max_retries} attempts: {str(e)}")
-                        await asyncio.sleep(1)  # Wait before retry
-                        continue
-
-        except Exception as e:
-            logger.error(f"Error in store_in_pinecone: {str(e)}")
-            
-        logger.info(f"Total vectors stored: {stored_count}")
-        return stored_count
 
     async def update_progress(self, progress_data: Dict):
         """Update progress in Redis with TTL and MongoDB"""
@@ -687,47 +735,58 @@ class HybridCrawler:
 
     @classmethod
     async def process_university(cls, url: str, program: str, university_id: str, progress_callback=None, url_limit: int = None):
-        """Main processing method with progress tracking"""
+        """Main processing method with sitemap discovery and progress tracking
+        Note: url_limit is ignored to ensure ALL pages are crawled
+        """
         try:
+            # Create crawler instance
             instance = cls(
                 openai_api_key=os.getenv('OPENAI_API_KEY'),
                 pinecone_api_key=os.getenv('PINECONE_API_KEY'),
                 index_name=os.getenv('INDEX_NAME')
             )
             
-            # Initialize crawl
+            # IMPORTANT: We will completely ignore the url_limit parameter 
+            # and always crawl everything
+            
+            # Initialize crawl with sitemap discovery
             await instance.initialize_crawl(url, program, university_id)
             namespace = f"uni_{university_id}"
             
-            print(f"Processing university {university_id} with limit: {url_limit}")
+            print(f"Processing university {university_id}")
             print(f"Using namespace: {namespace}")
+            print(f"Found {len(instance.sitemap_urls)} URLs from sitemaps")
+            print(f"Will process ALL URLs regardless of any limit")
             
             # Initial progress
             if progress_callback:
                 progress_callback({
                     'processed_urls': 0,
-                    'total_urls': 1,
+                    'total_urls': max(1, len(instance.urls_to_visit)),
                     'data_chunks': 0,
-                    'phase': 'initializing'
+                    'phase': 'initializing',
+                    'sitemap_urls': len(instance.sitemap_urls)
                 })
                 
-            # Crawl with progress updates
+            # Crawl with progress updates - IMPORTANT: Pass None for url_limit to crawl everything
             crawl_result = await instance.crawl(
                 progress_callback=progress_callback,
-                url_limit=url_limit
+                url_limit=None  # Force to None to ensure ALL pages are crawled
             )
             
             if not crawl_result.get('success'):
                 return {
                     'success': False,
                     'error': crawl_result.get('error', 'No data extracted from website'),
-                    'stored_count': 0
+                    'stored_count': crawl_result.get('stored_count', 0)
                 }
                 
             return {
                 'success': True,
                 'pages_crawled': crawl_result.get('pages_crawled', 0),
-                'stored_count': crawl_result.get('stored_count', 0)
+                'total_pages': crawl_result.get('total_pages', 0),
+                'stored_count': crawl_result.get('stored_count', 0),
+                'sitemap_urls': len(instance.sitemap_urls)
             }
             
         except Exception as e:
@@ -750,6 +809,8 @@ class HybridCrawler:
                 self.visited_urls.clear()
             if hasattr(self, 'urls_to_visit'):
                 self.urls_to_visit.clear()
+            if hasattr(self, 'sitemap_urls'):
+                self.sitemap_urls.clear()
             if hasattr(self, 'extracted_data'):
                 self.extracted_data.clear()
                 
