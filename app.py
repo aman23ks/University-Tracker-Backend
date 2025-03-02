@@ -1536,6 +1536,222 @@ def get_university_visibility():
         app.logger.error(f"Error getting university visibility: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/feedback', methods=['POST'])
+@jwt_required()
+def submit_feedback():
+    """Submit user feedback, bug report, or feature request"""
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        data = request.json
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        feedback_types = ['bug', 'feature', 'question', 'other']
+        if 'type' not in data or data['type'] not in feedback_types:
+            return jsonify({'error': 'Invalid feedback type'}), 400
+            
+        if 'content' not in data or not data['content'].strip():
+            return jsonify({'error': 'Feedback content is required'}), 400
+            
+        # Create feedback record
+        feedback = {
+            'user_email': current_user,
+            'type': data['type'],
+            'content': data['content'],
+            'contact_email': data.get('contact_email', user.get('email')),
+            'status': 'new',
+            'created_at': datetime.utcnow(),
+            'updated_at': datetime.utcnow()
+        }
+        
+        # Store feedback in database
+        feedback_id = db.create_feedback(feedback)
+        
+        # Optional: Send notification to admin
+        # notify_admin_about_new_feedback(feedback)
+        
+        return jsonify({
+            'success': True, 
+            'message': 'Feedback submitted successfully',
+            'id': feedback_id
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error submitting feedback: {str(e)}")
+        return jsonify({'error': 'Failed to submit feedback'}), 500
+
+@app.route('/api/feedback', methods=['GET'])
+@jwt_required()
+def get_feedback():
+    """Get all feedback (admin only) or user's own feedback"""
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        # Check if user is admin
+        is_admin = user.get('is_admin', False)
+        
+        # Get query parameters
+        status = request.args.get('status')
+        feedback_type = request.args.get('type')
+        limit = int(request.args.get('limit', 100))
+        skip = int(request.args.get('skip', 0))
+        
+        # Build query
+        query = {}
+        if not is_admin:
+            # Regular users can only view their own feedback
+            query['user_email'] = current_user
+            
+        if status:
+            query['status'] = status
+            
+        if feedback_type:
+            query['type'] = feedback_type
+            
+        # Get feedback from database
+        feedback_items = db.get_feedback(query, limit, skip)
+        total_count = db.count_feedback(query)
+        
+        return jsonify({
+            'items': feedback_items,
+            'total': total_count,
+            'limit': limit,
+            'skip': skip
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error getting feedback: {str(e)}")
+        return jsonify({'error': 'Failed to get feedback'}), 500
+        
+@app.route('/api/feedback/<string:feedback_id>', methods=['GET'])
+@jwt_required()
+def get_feedback_by_id(feedback_id):
+    """Get specific feedback by ID"""
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        # Get feedback from database
+        feedback = db.get_feedback_by_id(feedback_id)
+        
+        if not feedback:
+            return jsonify({'error': 'Feedback not found'}), 404
+            
+        # Check permissions - only admins or the user who submitted it can view
+        if not user.get('is_admin') and feedback.get('user_email') != current_user:
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        return jsonify(feedback)
+        
+    except Exception as e:
+        app.logger.error(f"Error getting feedback details: {str(e)}")
+        return jsonify({'error': 'Failed to get feedback details'}), 500
+
+@app.route('/api/feedback/<string:feedback_id>', methods=['PUT'])
+@jwt_required()
+def update_feedback(feedback_id):
+    """Update feedback status (admin only)"""
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        # Only admins can update feedback status
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        data = request.json
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        # Get valid status values
+        valid_statuses = ['new', 'in_progress', 'completed', 'rejected', 'emailed']
+        
+        if 'status' not in data or data['status'] not in valid_statuses:
+            return jsonify({'error': f'Invalid status. Must be one of: {", ".join(valid_statuses)}'}), 400
+            
+        # Get the existing feedback to check for changes
+        current_feedback = db.get_feedback_by_id(feedback_id)
+        if not current_feedback:
+            return jsonify({'error': 'Feedback not found'}), 404
+            
+        # Update feedback in database
+        update_data = {
+            'status': data['status'],
+            'updated_at': datetime.utcnow(),
+            'updated_by': current_user
+        }
+        
+        # Only update admin notes if provided
+        if 'admin_notes' in data:
+            update_data['admin_notes'] = data['admin_notes']
+        
+        # If response is provided and different from current, add it with timestamp
+        if 'response' in data:
+            # Check if response is different or there was no previous response
+            if 'response' not in current_feedback or data['response'] != current_feedback['response']:
+                update_data['response'] = data['response']
+                update_data['responded_at'] = datetime.utcnow()
+            else:
+                # Keep the same response without updating timestamp
+                update_data['response'] = data['response']
+            
+        result = db.update_feedback(feedback_id, update_data)
+        
+        if not result:
+            return jsonify({'error': 'Failed to update feedback'}), 500
+            
+        # Get the updated feedback to return
+        updated_feedback = db.get_feedback_by_id(feedback_id)
+            
+        return jsonify({
+            'success': True,
+            'message': 'Feedback updated successfully',
+            'feedback': updated_feedback
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error updating feedback: {str(e)}")
+        return jsonify({'error': 'Failed to update feedback'}), 500
+
+@app.route('/api/feedback/stats', methods=['GET'])
+@jwt_required()
+def get_feedback_stats():
+    """Get feedback statistics (admin only)"""
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        # Only admins can view statistics
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        # Get statistics from database
+        stats = {
+            'total': db.count_feedback({}),
+            'by_type': {
+                'bug': db.count_feedback({'type': 'bug'}),
+                'feature': db.count_feedback({'type': 'feature'}),
+                'question': db.count_feedback({'type': 'question'}),
+                'other': db.count_feedback({'type': 'other'})
+            },
+            'by_status': {
+                'new': db.count_feedback({'status': 'new'}),
+                'in_progress': db.count_feedback({'status': 'in_progress'}),
+                'completed': db.count_feedback({'status': 'completed'}),
+                'rejected': db.count_feedback({'status': 'rejected'}),
+                'emailed': db.count_feedback({'status': 'emailed'})
+            }
+        }
+        
+        return jsonify(stats)
+        
+    except Exception as e:
+        app.logger.error(f"Error getting feedback stats: {str(e)}")
+        return jsonify({'error': 'Failed to get feedback statistics'}), 500
+
 @app.errorhandler(500)
 def handle_500_error(e):
     app.logger.error(f"Internal Server Error: {str(e)}")
