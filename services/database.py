@@ -1168,3 +1168,107 @@ class MongoDB:
         except Exception as e:
             logger.error(f"Error marking pending columns as processed: {str(e)}")
             return {'error': str(e)}
+
+    def create_feedback(self, feedback_data: dict) -> str:
+        """Create a new feedback record and return the ID"""
+        try:
+            # Add ID
+            feedback_data['_id'] = str(ObjectId())
+            
+            # Insert into database
+            self.db.feedback.insert_one(feedback_data)
+            
+            return feedback_data['_id']
+        except Exception as e:
+            logger.error(f"Error creating feedback: {str(e)}")
+            return None
+
+    def get_feedback(self, query: dict, limit: int = 100, skip: int = 0) -> list:
+        """Get feedback items with pagination"""
+        try:
+            # Get feedback from database with sorting
+            cursor = self.db.feedback.find(
+                query
+            ).sort('created_at', -1).skip(skip).limit(limit)
+            
+            # Convert to list and format dates
+            feedback_items = []
+            for item in cursor:
+                # Convert ObjectId to string
+                item['_id'] = str(item['_id'])
+                
+                # Format dates
+                if 'created_at' in item:
+                    item['created_at'] = item['created_at'].isoformat()
+                if 'updated_at' in item:
+                    item['updated_at'] = item['updated_at'].isoformat()
+                if 'responded_at' in item:
+                    item['responded_at'] = item['responded_at'].isoformat()
+                
+                feedback_items.append(item)
+                
+            return feedback_items
+        except Exception as e:
+            logger.error(f"Error getting feedback: {str(e)}")
+            return []
+
+    def count_feedback(self, query: dict) -> int:
+        """Count feedback items matching query"""
+        try:
+            return self.db.feedback.count_documents(query)
+        except Exception as e:
+            logger.error(f"Error counting feedback: {str(e)}")
+            return 0
+
+    def get_feedback_by_id(self, feedback_id: str) -> dict:
+        """Get specific feedback by ID"""
+        try:
+            feedback = self.db.feedback.find_one({'_id': feedback_id})
+            
+            if not feedback:
+                return None
+                
+            # Convert ObjectId to string and format dates
+            feedback['_id'] = str(feedback['_id'])
+            if 'created_at' in feedback:
+                feedback['created_at'] = feedback['created_at'].isoformat()
+            if 'updated_at' in feedback:
+                feedback['updated_at'] = feedback['updated_at'].isoformat()
+            if 'responded_at' in feedback:
+                feedback['responded_at'] = feedback['responded_at'].isoformat()
+                
+            return feedback
+        except Exception as e:
+            logger.error(f"Error getting feedback by ID: {str(e)}")
+            return None
+
+    def update_feedback(self, feedback_id: str, update_data: dict) -> bool:
+        """Update feedback status or other fields"""
+        try:
+            # Add a timestamp to the update if not already present
+            if 'updated_at' not in update_data:
+                update_data['updated_at'] = datetime.utcnow()
+                
+            # Update in database
+            result = self.db.feedback.update_one(
+                {'_id': feedback_id},
+                {'$set': update_data}
+            )
+            
+            # Return True if successful (document was found), False otherwise
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error updating feedback: {str(e)}")
+            return False
+
+    def delete_feedback(self, feedback_id: str) -> bool:
+        """Delete feedback record (admin only)"""
+        try:
+            # Delete from database
+            result = self.db.feedback.delete_one({'_id': feedback_id})
+            
+            # Return True if successful, False otherwise
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Error deleting feedback: {str(e)}")
+            return False

@@ -91,7 +91,7 @@ class RAGRetrieval:
 
                 processed_results = []
                 for match in results.matches:
-                    if match.score > 0.1:  # Lower threshold for testing
+                    if match.score > 0.5:  # Lower threshold for testing
                         result = {
                             'text': match.metadata.get('text', ''),
                             'url': match.metadata.get('url', ''),
@@ -185,9 +185,20 @@ class RAGRetrieval:
             Answer:"""
 
             response = self.client.chat.completions.create(
-                model="gpt-4o-mini",  # Using GPT-4 for better answers
+                model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "system", "content":  """You are an expert educational assistant specializing in university information. Your role is to help students find accurate details about university programs, admissions requirements, deadlines, courses, and other academic information.
+
+                            When answering questions:
+                            1. Focus on facts and specific information from the provided context
+                            2. Present information in a clear, organized manner
+                            3. When discussing requirements like GRE/TOEFL scores, tuition fees, or deadlines, be precise with numbers
+                            4. For program-specific information, clearly indicate which program you're referring to
+                            5. When the context contains multiple pieces of relevant information, structure your response logically
+                            6. If the context doesn't contain the answer, honestly state "Based on the available information, I cannot find details about [topic]. You may want to check the university's official website or contact their admissions office."
+
+                            Remember that students rely on your accuracy for important educational decisions. Always prioritize precision over comprehensiveness when uncertain."""
+                    },
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0,
