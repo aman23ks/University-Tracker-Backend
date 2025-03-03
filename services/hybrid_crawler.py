@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+import hashlib
 import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -658,7 +659,7 @@ class HybridCrawler:
                         continue
                     
                     vector = {
-                        'id': f"{doc['url'].replace('://', '_').replace('/', '_')}_{idx}",
+                        'id': f"{hashlib.md5(doc['url'].encode()).hexdigest()}_{idx}_{int(time.time())}",
                         'values': embedding,
                         'metadata': {
                             'text': chunk,
