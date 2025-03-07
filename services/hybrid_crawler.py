@@ -11,9 +11,6 @@ from openai import OpenAI
 from pinecone import Pinecone
 import trafilatura
 from datetime import datetime
-from typing import Optional
-from concurrent.futures import ThreadPoolExecutor
-import cachetools
 import time
 import os
 import redis
@@ -23,31 +20,70 @@ from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
-# Initialize Redis client
-redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST', 'localhost'),
-    port=int(os.getenv('REDIS_PORT', 6379)),
-    db=0,
-    decode_responses=True
-)
+# Define important keywords for targeting specific information
+IMPORTANT_KEYWORDS = [
+    # Admissions related
+    'admission', 'application', 'deadline', 'requirements', 'apply', 'eligibility',
+    'selection', 'entry requirements', 'application process',
+    
+    # Academics related
+    'curriculum', 'course', 'syllabus', 'program structure', 'specialization',
+    'concentration', 'major', 'minor', 'credit', 'semester', 'academic requirements',
+    
+    # Fees and financial aid
+    'tuition', 'fee', 'cost', 'financial', 'scholarship', 'funding', 'aid',
+    'assistantship', 'payment', 'expense', 'waiver',
+    
+    # Test scores
+    'gre', 'gmat', 'toefl', 'ielts', 'sat', 'act', 'test requirement',
+    'english proficiency', 'language requirement', 'score', 'minimum score',
+    
+    # Deadlines
+    'deadline', 'due date', 'application timeline', 'important dates',
+    'rolling admission', 'early admission', 'priority deadline',
+    
+    # Documentation requirements
+    'prerequisite', 'document', 'transcript', 'recommendation',
+    'resume', 'cv', 'statement of purpose', 'personal statement', 'letter of recommendation',
+    
+    # Placements and career outcomes
+    'placement', 'career', 'job', 'employment', 'internship', 'recruitment',
+    'salary', 'companies', 'employers', 'industry', 'opportunities', 'alumni',
+    
+    # Class size and teaching approach
+    'class size', 'student-faculty ratio', 'average class', 'faculty-student',
+    'classroom size', 'cohort size', 'batch size', 'teaching assistant',
+    
+    # Faculty information
+    'faculty', 'professor', 'instructor', 'teacher', 'staff', 'research interest',
+    'expertise', 'department', 'specialization',
+    
+    # Campus and facilities
+    'student life', 'campus', 'housing', 'accommodation', 'dormitory', 'residence',
+    'club', 'organization', 'activity', 'event', 'facility',
+    
+    # International student information
+    'international student', 'visa', 'i-20', 'foreign', 'global', 'overseas',
+    'international application', 'international admission'
+]
 
 class HybridCrawler:
     def __init__(self, openai_api_key: str, pinecone_api_key: str, index_name: str):
         self.visited_urls: Set[str] = set()
         self.urls_to_visit: deque = deque()
-        self.sitemap_urls: Set[str] = set()  # New: Store sitemap URLs separately
+        self.sitemap_urls: Set[str] = set()
+        self.important_urls: Set[str] = set()  # URLs with important keywords
         self.extracted_data: List[Dict] = []
+        
         self.client = OpenAI(api_key=openai_api_key)
         self.pc = Pinecone(api_key=pinecone_api_key)
         self.index = self.pc.Index(index_name)
+        
         self.openai_api_key = openai_api_key
         self.pinecone_api_key = pinecone_api_key
         self.index_name = index_name
         
-        # Memory-efficient caching with longer TTL
-        self.embedding_cache = cachetools.TTLCache(maxsize=1000, ttl=3600)
-        
-        # Production-optimized headers
+        # Headers for HTTP requests
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -57,14 +93,13 @@ class HybridCrawler:
             'Upgrade-Insecure-Requests': '1'
         }
         
-        # Production-optimized limits
-        self.batch_size = 20  # Increased to process more URLs per batch
-        self.concurrent_requests = 15  # Increased concurrency
-        self.timeout = 15  # Longer timeout for complex pages
-        self.min_request_interval = 0.05  # Faster requests
-        self.max_retries = 3  # Retry failed requests
+        # Request configuration
+        self.batch_size = 20
+        self.concurrent_requests = 15
+        self.timeout = 15
+        self.max_retries = 3
         
-        # Less restrictive URL filtering for better coverage
+        # URL filtering
         self.ignore_patterns = re.compile(
             r'\.(css|js|jpg|jpeg|png|gif|pdf|zip|ico|svg)$|'
             r'(login|logout|signup|signin|register|auth)',
@@ -74,15 +109,13 @@ class HybridCrawler:
         # Stats tracking
         self.stats = {
             'pages_crawled': 0,
-            'pages_extracted': 0,
-            'sitemap_urls_found': 0
+            'urls_discovered': 0,
+            'important_urls_found': 0,
+            'stored_chunks': 0
         }
-        
-        # IMPORTANT: Override any URL limit to ensure ALL pages are crawled
-        self.enforce_url_limit = False
 
     async def initialize_crawl(self, root_url: str, program: str, university_id: str):
-        """Initialize crawling with sitemap discovery"""
+        """Initialize crawling with root URL and program info"""
         self.root_domain = urlparse(root_url).netloc
         self.scheme = urlparse(root_url).scheme
         self.program = program
@@ -92,16 +125,18 @@ class HybridCrawler:
         self.visited_urls.clear()
         self.urls_to_visit.clear()
         self.sitemap_urls.clear()
+        self.important_urls.clear()
         self.extracted_data.clear()
         
         # Reset stats
         self.stats = {
             'pages_crawled': 0,
-            'pages_extracted': 0,
-            'sitemap_urls_found': 0
+            'urls_discovered': 0,
+            'important_urls_found': 0,
+            'stored_chunks': 0
         }
         
-        # Try to discover sitemaps first
+        # Start with discovering sitemaps for efficient URL collection
         await self.discover_sitemaps()
         
         # Add all sitemap URLs to the queue
@@ -113,18 +148,9 @@ class HybridCrawler:
         # Add root URL if queue is empty
         if not self.urls_to_visit:
             self.urls_to_visit.append(root_url)
-        
-        # Initialize progress in Redis
-        await self.update_progress({
-            'status': 'initializing',
-            'total_urls': len(self.urls_to_visit),
-            'processed_urls': 0,
-            'current_batch': 0,
-            'sitemap_urls': len(self.sitemap_urls)
-        })
 
     async def discover_sitemaps(self):
-        """Find and process sitemap files"""
+        """Find sitemap files to get initial URLs"""
         base_url = f"{self.scheme}://{self.root_domain}"
         sitemap_paths = [
             '/sitemap.xml',
@@ -134,7 +160,7 @@ class HybridCrawler:
             '/sitemaps/',
             '/sitemap.gz',
             '/sitemap.xml.gz',
-            '/robots.txt'  # Check robots.txt for sitemap directives
+            '/robots.txt'
         ]
         
         logger.info(f"Looking for sitemaps at {self.root_domain}")
@@ -145,7 +171,6 @@ class HybridCrawler:
                 async with session.get(f"{base_url}/robots.txt", headers=self.headers, timeout=10) as response:
                     if response.status == 200:
                         text = await response.text()
-                        # Parse sitemap URLs from robots.txt
                         sitemap_matches = re.findall(r'Sitemap:\s*(https?://[^\s]+)', text, re.IGNORECASE)
                         for sitemap_url in sitemap_matches:
                             await self.process_sitemap(session, sitemap_url.strip())
@@ -165,7 +190,7 @@ class HybridCrawler:
                     logger.warning(f"Error checking sitemap at {path}: {str(e)}")
 
     async def process_sitemap(self, session, sitemap_url):
-        """Process a sitemap XML file"""
+        """Process a sitemap XML file to extract URLs"""
         try:
             async with session.get(sitemap_url, headers=self.headers, timeout=15) as response:
                 if response.status != 200:
@@ -210,12 +235,18 @@ class HybridCrawler:
                             if loc is not None and loc.text:
                                 page_url = loc.text.strip()
                                 # Filter URLs by domain and patterns
-                                if self.root_domain in urlparse(page_url).netloc and not self.ignore_patterns.search(page_url):
+                                if self.is_valid_url(page_url):
                                     self.sitemap_urls.add(page_url)
                                     count += 1
+                                    
+                                    # Check URL path for important keywords
+                                    url_lower = page_url.lower()
+                                    if any(keyword in url_lower for keyword in IMPORTANT_KEYWORDS):
+                                        self.important_urls.add(page_url)
+                                        self.stats['important_urls_found'] += 1
                         
                         logger.info(f"Added {count} URLs from sitemap {sitemap_url}")
-                        self.stats['sitemap_urls_found'] += count
+                        self.stats['urls_discovered'] += count
                     except ET.ParseError:
                         logger.warning(f"XML parsing error in sitemap: {sitemap_url}")
         
@@ -223,7 +254,7 @@ class HybridCrawler:
             logger.error(f"Error processing sitemap {sitemap_url}: {str(e)}")
 
     def is_valid_url(self, url: str) -> bool:
-        """Improved URL validation"""
+        """Validate URL for crawling"""
         try:
             parsed = urlparse(url)
             
@@ -252,37 +283,8 @@ class HybridCrawler:
         except Exception:
             return False
 
-    def get_embedding(self, text: str) -> List[float]:
-        """Get OpenAI embedding with caching"""
-        # Check cache first
-        cache_key = hash(text)
-        if cache_key in self.embedding_cache:
-            return self.embedding_cache[cache_key]
-            
-        try:
-            response = self.client.embeddings.create(
-                model="text-embedding-ada-002",
-                input=text
-            )
-            embedding = response.data[0].embedding
-            # Cache the result
-            self.embedding_cache[cache_key] = embedding
-            return embedding
-        except Exception as e:
-            logger.error(f"Error getting embedding: {str(e)}")
-            return []
-
-    def clean_text(self, text: str) -> str:
-        """Clean and normalize text"""
-        try:
-            text = re.sub(r'\s+', ' ', text)
-            text = re.sub(r'[^\w\s.,;?!-]', '', text)
-            return text.strip()
-        except Exception:
-            return text
-
     async def extract_all_links(self, html: str, base_url: str) -> Set[str]:
-        """Enhanced link extraction for better coverage"""
+        """Extract all links from HTML content"""
         links = set()
         try:
             # Use lxml parser for speed
@@ -330,81 +332,33 @@ class HybridCrawler:
         except Exception as e:
             logger.error(f"Error extracting links from {base_url}: {str(e)}")
             return links
+
+    def contains_important_keywords(self, text: str, url: str) -> bool:
+        """Check if text or URL contains any important keywords"""
+        text_lower = text.lower()
+        url_lower = url.lower()
         
-    async def process_content(self, url: str, html_content: str) -> Optional[Dict]:
-        """Improved content extraction"""
-        try:
-            # First try with trafilatura
-            extracted_text = trafilatura.extract(
-                html_content,
-                include_comments=False,
-                no_fallback=False,
-                include_tables=True,
-                target_language=None,
-                deduplicate=True,
-                favor_recall=True  # Extract more content
-            )
-            
-            # Fallback to BeautifulSoup
-            if not extracted_text or len(extracted_text.strip()) < 100:
-                soup = BeautifulSoup(html_content, 'lxml')
+        # Check URL first (faster than checking content)
+        for keyword in IMPORTANT_KEYWORDS:
+            if keyword in url_lower:
+                return True
+        
+        # Then check content
+        for keyword in IMPORTANT_KEYWORDS:
+            if keyword in text_lower:
+                return True
                 
-                # Remove noise elements
-                for tag in soup.find_all(['script', 'style', 'iframe']):
-                    tag.decompose()
-                
-                # Try to find main content
-                main_content = None
-                for selector in ['main', 'article', '#content', '.content', '#main', '.main']:
-                    found = soup.select(selector)
-                    if found:
-                        main_content = found[0]
-                        break
-                
-                # If no main content, use body
-                if not main_content:
-                    main_content = soup.body
-                
-                if main_content:
-                    # Get all text elements
-                    paragraphs = main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'td', 'div'])
-                    extracted_text = ' '.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20])
-                    
-            if extracted_text:
-                # Clean and normalize text
-                cleaned_text = ' '.join(extracted_text.split())
-                if len(cleaned_text.split()) > 50:  # Only keep if meaningful content
-                    logger.info(f"Successfully extracted {len(cleaned_text.split())} words from {url}")
-                    self.stats['pages_extracted'] += 1
-                    
-                    # Get page title
-                    title = ""
-                    try:
-                        soup = BeautifulSoup(html_content, 'lxml')
-                        if soup.title:
-                            title = soup.title.string.strip()
-                    except:
-                        pass
-                    
-                    return {
-                        'url': url,
-                        'content': cleaned_text,
-                        'metadata': {
-                            'program': self.program,
-                            'title': title,
-                            'timestamp': datetime.utcnow().isoformat()
-                        }
-                    }
-            
-            logger.warning(f"No meaningful content extracted from {url}")
-            return None
+        return False
 
-        except Exception as e:
-            logger.error(f"Error processing content from {url}: {str(e)}")
-            return None
-
-    async def crawl_url(self, session: aiohttp.ClientSession, url: str) -> None:
-        """Improved URL crawling with better error handling"""
+    async def crawl_url(self, session: aiohttp.ClientSession, url: str, extract_only: bool = True) -> None:
+        """
+        Crawl URL to either extract links or process content
+        
+        Args:
+            session: HTTP session
+            url: URL to crawl
+            extract_only: If True, only extract links without processing content
+        """
         if url in self.visited_urls:
             return
             
@@ -428,18 +382,33 @@ class HybridCrawler:
                             
                         html = await response.text()
                         
-                        # Process content first
-                        processed_data = await self.process_content(url, html)
-                        if processed_data:
-                            self.extracted_data.append(processed_data)
-                        
-                        # Extract and queue new links
-                        new_links = await self.extract_all_links(html, url)
-                        
-                        # Add new links to the queue if not already visited
-                        for new_url in new_links:
-                            if new_url not in self.visited_urls and new_url not in self.urls_to_visit:
-                                self.urls_to_visit.append(new_url)
+                        if extract_only:
+                            # Extract links and check for important keywords
+                            new_links = await self.extract_all_links(html, url)
+                            
+                            # Add new links to the queue if not already visited
+                            for new_url in new_links:
+                                if new_url not in self.visited_urls and new_url not in self.urls_to_visit:
+                                    self.urls_to_visit.append(new_url)
+                                    self.stats['urls_discovered'] += 1
+                            
+                            # Check if this page contains important keywords
+                            if self.contains_important_keywords(html, url):
+                                self.important_urls.add(url)
+                                self.stats['important_urls_found'] += 1
+                        else:
+                            # Process content for storage
+                            # This only happens in phase 2 for important URLs
+                            content = await self.extract_content(html, url)
+                            if content:
+                                self.extracted_data.append({
+                                    'url': url,
+                                    'content': content,
+                                    'metadata': {
+                                        'program': self.program,
+                                        'timestamp': datetime.utcnow().isoformat()
+                                    }
+                                })
                         
                         # Update stats
                         self.stats['pages_crawled'] += 1
@@ -470,30 +439,71 @@ class HybridCrawler:
                 await asyncio.sleep(1 * (attempt + 1))
                 continue
 
-    async def crawl(self, progress_callback=None, url_limit: int = None) -> Dict:
-        """Enhanced crawling with no actual URL limit to ensure ALL pages are crawled"""
-        actual_limit = None  # IMPORTANT: We're ignoring url_limit to crawl everything
-        
-        # Only log the original URL limit for debugging, but we won't use it
-        print(f"Starting crawl with URL limit: {url_limit or 'unlimited'} (Actual: unlimited)")
+    async def extract_content(self, html: str, url: str) -> str:
+        """Extract and clean content from HTML"""
+        try:
+            # First try with trafilatura
+            extracted_text = trafilatura.extract(
+                html,
+                include_comments=False,
+                no_fallback=False,
+                include_tables=True,
+                target_language=None,
+                deduplicate=True,
+                favor_recall=True  # Extract more content
+            )
+            
+            # Fallback to BeautifulSoup
+            if not extracted_text or len(extracted_text.strip()) < 100:
+                soup = BeautifulSoup(html, 'lxml')
+                
+                # Remove noise elements
+                for tag in soup.find_all(['script', 'style', 'iframe']):
+                    tag.decompose()
+                
+                # Try to find main content
+                main_content = None
+                for selector in ['main', 'article', '#content', '.content', '#main', '.main']:
+                    found = soup.select(selector)
+                    if found:
+                        main_content = found[0]
+                        break
+                
+                # If no main content, use body
+                if not main_content:
+                    main_content = soup.body
+                
+                if main_content:
+                    # Get all text elements
+                    paragraphs = main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'td', 'div'])
+                    extracted_text = ' '.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20])
+                    
+            if extracted_text:
+                # Clean and normalize text
+                cleaned_text = ' '.join(extracted_text.split())
+                if len(cleaned_text.split()) > 50:  # Only keep if meaningful content
+                    return cleaned_text
+            
+            return None
+
+        except Exception as e:
+            logger.error(f"Error extracting content from {url}: {str(e)}")
+            return None
+
+    async def phase1_discover_urls(self, progress_callback=None):
+        """
+        Phase 1: Discover all URLs and identify important ones
+        """
+        print(f"Starting Phase 1: URL discovery")
         
         try:
-            stored_count = 0
-            batch_size = 50  # Process in batches of 50
             processed_urls = 0
-            total_urls_found = len(self.urls_to_visit) + len(self.sitemap_urls)
-            
-            print(f"Total URLs to process: {total_urls_found}")
-            
-            # Start with sitemap URLs if found
-            if self.sitemap_urls:
-                print(f"Processing ALL {len(self.sitemap_urls)} URLs from sitemap")
             
             connector = aiohttp.TCPConnector(limit=self.concurrent_requests, ssl=False)
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                # Keep processing until the queue is empty - ALWAYS process ALL URLs
+                # Process URLs until queue is empty
                 while self.urls_to_visit:
                     # Process URLs in batches
                     batch_urls = []
@@ -508,42 +518,100 @@ class HybridCrawler:
                     if not batch_urls:
                         continue
                     
-                    total_now = processed_urls + len(self.urls_to_visit)
-                    if total_now > total_urls_found:
-                        total_urls_found = total_now
-                    
-                    print(f"Processing batch of {len(batch_urls)} URLs. Progress: {processed_urls}/{total_urls_found}")
-                    
-                    # Process batch
-                    tasks = [self.crawl_url(session, url) for url in batch_urls]
+                    # Process batch (extract only)
+                    tasks = [self.crawl_url(session, url, extract_only=True) for url in batch_urls]
                     await asyncio.gather(*tasks, return_exceptions=True)
                     
                     # Update progress
                     if progress_callback:
                         progress_callback({
+                            'phase': 'discovery',
                             'processed_urls': processed_urls,
-                            'total_urls': total_urls_found,
-                            'data_chunks': stored_count
+                            'total_discovered': self.stats['urls_discovered'],
+                            'important_urls': len(self.important_urls)
                         })
+                    
+                    # Log progress
+                    if processed_urls % 100 == 0:
+                        print(f"Phase 1 Progress: {processed_urls} URLs processed, {len(self.important_urls)} important URLs found")
+                    
+                    await asyncio.sleep(0.05)  # Small delay between batches
+            
+            print(f"Phase 1 Complete: {processed_urls} URLs processed, {len(self.important_urls)} important URLs found")
+            
+            # Store important URLs in MongoDB
+            await self.store_important_urls_in_mongodb()
+            
+            return {
+                'success': True,
+                'processed_urls': processed_urls,
+                'important_urls': len(self.important_urls)
+            }
+            
+        except Exception as e:
+            print(f"Error in Phase 1: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
+    async def phase2_process_important_urls(self, progress_callback=None):
+        """
+        Phase 2: Process and store content from important URLs
+        """
+        print(f"Starting Phase 2: Processing {len(self.important_urls)} important URLs")
+        
+        try:
+            processed_urls = 0
+            stored_count = 0
+            
+            # Reset visited URLs for phase 2
+            self.visited_urls.clear()
+            self.extracted_data.clear()
+            
+            # Create queue from important URLs
+            urls_queue = deque(self.important_urls)
+            
+            connector = aiohttp.TCPConnector(limit=self.concurrent_requests, ssl=False)
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                # Process important URLs
+                while urls_queue:
+                    # Process URLs in batches
+                    batch_urls = []
+                    for _ in range(min(self.batch_size, len(urls_queue))):
+                        if not urls_queue:
+                            break
+                        url = urls_queue.popleft()
+                        if url not in self.visited_urls:
+                            batch_urls.append(url)
+                            processed_urls += 1
+
+                    if not batch_urls:
+                        continue
+                    
+                    # Process batch (full content processing)
+                    tasks = [self.crawl_url(session, url, extract_only=False) for url in batch_urls]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    
                     # Store batch data when we have enough
-                    if len(self.extracted_data) >= batch_size:
+                    if len(self.extracted_data) >= 5:
                         print(f"Storing batch of {len(self.extracted_data)} documents")
                         namespace = f"uni_{self.university_id}"
                         batch_count = await self.store_batch_in_pinecone(self.extracted_data, namespace)
                         stored_count += batch_count
                         print(f"Stored {batch_count} chunks in Pinecone")
+                        self.stats['stored_chunks'] += batch_count
                         self.extracted_data = []  # Clear after storing
                     
-                    # Report progress more frequently
-                    if processed_urls % 100 == 0:
-                        print(f"Progress update: {processed_urls} URLs processed, {len(self.urls_to_visit)} URLs remaining")
-                        # Update MongoDB
-                        await self.update_progress({
-                            'status': 'processing',
+                    # Update progress
+                    if progress_callback:
+                        progress_callback({
+                            'phase': 'processing',
                             'processed_urls': processed_urls,
-                            'total_urls': total_urls_found,
-                            'data_chunks': stored_count
+                            'total_urls': len(self.important_urls),
+                            'stored_chunks': stored_count
                         })
                     
                     await asyncio.sleep(0.05)  # Small delay between batches
@@ -554,59 +622,46 @@ class HybridCrawler:
                     namespace = f"uni_{self.university_id}"
                     batch_count = await self.store_batch_in_pinecone(self.extracted_data, namespace)
                     stored_count += batch_count
+                    self.stats['stored_chunks'] += batch_count
                     print(f"Stored final {batch_count} chunks in Pinecone")
-                
-                print(f"\nCrawl Summary:")
-                print(f"Total URLs processed: {processed_urls}")
-                print(f"Total pages crawled: {self.stats['pages_crawled']}")
-                print(f"Total pages with content: {self.stats['pages_extracted']}")
-                print(f"Total data chunks stored: {stored_count}")
-                
-                return {
-                    'success': True,
-                    'stored_count': stored_count,
-                    'processed_urls': processed_urls,
-                    'pages_crawled': len(self.visited_urls),
-                    'total_pages': total_urls_found
-                }
-                
+            
+            print(f"Phase 2 Complete: {processed_urls} important URLs processed, {stored_count} chunks stored")
+            
+            return {
+                'success': True,
+                'processed_urls': processed_urls,
+                'stored_chunks': stored_count
+            }
+            
         except Exception as e:
-            print(f"Error in crawl: {str(e)}")
+            print(f"Error in Phase 2: {str(e)}")
             return {
                 'success': False,
-                'error': str(e),
-                'processed_urls': processed_urls,
-                'stored_count': stored_count
+                'error': str(e)
             }
 
     async def get_embedding_async(self, text: str) -> List[float]:
-        """Asynchronous embedding generation"""
-        # Limit text length for embedding API
-        if len(text) > 8000:
-            text = text[:8000]
-            
-        cache_key = hash(text)
-        if cache_key in self.embedding_cache:
-            return self.embedding_cache[cache_key]
-            
+        """Get embedding for text asynchronously"""
         try:
+            # Limit text length for embedding API
+            if len(text) > 8000:
+                text = text[:8000]
+                
             response = await asyncio.to_thread(
                 self.client.embeddings.create,
                 model="text-embedding-ada-002",
                 input=text
             )
-            embedding = response.data[0].embedding
-            self.embedding_cache[cache_key] = embedding
-            return embedding
+            return response.data[0].embedding
         except Exception as e:
             logger.error(f"Error getting embedding: {str(e)}")
             return []
 
-    def chunk_text(self, text: str, chunk_size: int = 10000) -> List[str]:
-        """Optimized text chunking with better semantic boundaries"""
+    def chunk_text(self, text: str, chunk_size: int = 8000) -> List[str]:
+        """Split text into chunks for embedding"""
         chunks = []
         
-        # First, clean the text
+        # Clean the text
         text = re.sub(r'\s+', ' ', text).strip()
         
         # Split into sentences
@@ -637,7 +692,7 @@ class HybridCrawler:
         return chunks
 
     async def store_batch_in_pinecone(self, batch_data: List[Dict], namespace: str) -> int:
-        """Store processed data in Pinecone with better error handling"""
+        """Store processed data in Pinecone"""
         try:
             vectors = []
             stored_count = 0
@@ -653,11 +708,12 @@ class HybridCrawler:
                     if len(chunk.split()) < 50:  # Skip very short chunks
                         continue
                     
-                    # Use async embedding
+                    # Get embedding
                     embedding = await self.get_embedding_async(chunk)
                     if not embedding:
                         continue
                     
+                    # Create vector
                     vector = {
                         'id': f"{hashlib.md5(doc['url'].encode()).hexdigest()}_{idx}_{int(time.time())}",
                         'values': embedding,
@@ -665,14 +721,14 @@ class HybridCrawler:
                             'text': chunk,
                             'url': doc['url'],
                             'program': doc.get('metadata', {}).get('program', ''),
-                            'title': doc.get('metadata', {}).get('title', ''),
-                            'timestamp': datetime.utcnow().isoformat()
+                            'timestamp': datetime.utcnow().isoformat(),
+                            'is_important': True  # Mark all as important
                         }
                     }
                     vectors.append(vector)
                     
                     if len(vectors) >= 50:
-                        # Store batch asynchronously 
+                        # Store batch
                         await asyncio.to_thread(
                             self.index.upsert,
                             vectors=vectors,
@@ -690,54 +746,67 @@ class HybridCrawler:
                 )
                 stored_count += len(vectors)
                 
-            await asyncio.sleep(1)  
             return stored_count
             
         except Exception as e:
             print(f"Error in store_batch_in_pinecone: {str(e)}")
             return 0
 
-    async def update_progress(self, progress_data: Dict):
-        """Update progress in Redis with TTL and MongoDB"""
+    async def store_important_urls_in_mongodb(self):
+        """Store collected important URLs in MongoDB"""
         try:
-            # Update Redis
-            progress_key = f"university_progress:{self.university_id}"
-            redis_client.hset(
-                progress_key,
-                mapping=progress_data
-            )
-            redis_client.expire(
-                progress_key,
-                3600  # 1 hour TTL
-            )
-
-            # Update MongoDB status
-            status_data = {
-                'status': progress_data.get('status', 'processing'),
-                'progress': {
-                    'processed_urls': int(progress_data.get('processed_urls', 0)),
-                    'total_urls': int(progress_data.get('total_urls', 0)),
-                    'data_chunks': int(progress_data.get('data_chunks', 0))
-                },
-                'last_updated': datetime.utcnow()
-            }
-
-            # Add error if present
-            if 'error' in progress_data:
-                status_data['error'] = progress_data['error']
-
-            # Update MongoDB through database service
+            if not self.important_urls:
+                logger.info("No important URLs to store in MongoDB")
+                return False
+            
+            # Import MongoDB class here to avoid circular imports
             from services.database import MongoDB
             db = MongoDB(os.getenv('MONGODB_URI'))
-            db.update_university(self.university_id, status_data)
-
+            
+            # Prepare data to store
+            important_urls_data = {
+                'university_id': self.university_id,
+                'urls': list(self.important_urls),
+                'added_at': datetime.utcnow(),
+                'last_updated': datetime.utcnow(),
+                'count': len(self.important_urls),
+                'root_url': f"{self.scheme}://{self.root_domain}",
+                'program': self.program,
+                'stats': self.stats
+            }
+            
+            # Upsert to MongoDB
+            result = db.db.important_urls.update_one(
+                {'university_id': self.university_id},
+                {'$set': important_urls_data},
+                upsert=True
+            )
+            
+            success = result.modified_count > 0 or result.upserted_id is not None
+            logger.info(f"Stored {len(self.important_urls)} important URLs in MongoDB: {success}")
+            
+            # Also update the university record with important URLs count
+            db.update_university(self.university_id, {
+                'important_urls_count': len(self.important_urls),
+                'metadata': {
+                    'important_urls_last_updated': datetime.utcnow()
+                }
+            })
+            
+            return success
+            
         except Exception as e:
-            logger.error(f"Error updating progress: {str(e)}")
+            logger.error(f"Error storing important URLs in MongoDB: {str(e)}")
+            return False
 
     @classmethod
     async def process_university(cls, url: str, program: str, university_id: str, progress_callback=None, url_limit: int = None):
-        """Main processing method with sitemap discovery and progress tracking
-        Note: url_limit is ignored to ensure ALL pages are crawled
+        """
+        Main processing method with two-phase approach:
+        1. Discover all URLs and identify important ones
+        2. Process only important URLs and store their content
+        
+        Note: url_limit parameter is kept for backward compatibility but not used
         """
         try:
             # Create crawler instance
@@ -747,64 +816,73 @@ class HybridCrawler:
                 index_name=os.getenv('INDEX_NAME')
             )
             
-            # IMPORTANT: We will completely ignore the url_limit parameter 
-            # and always crawl everything
-            
-            # Initialize crawl with sitemap discovery
+            # Initialize crawl
             await instance.initialize_crawl(url, program, university_id)
             namespace = f"uni_{university_id}"
             
             print(f"Processing university {university_id}")
             print(f"Using namespace: {namespace}")
-            print(f"Found {len(instance.sitemap_urls)} URLs from sitemaps")
-            print(f"Will process ALL URLs regardless of any limit")
+            print(f"Starting two-phase crawling process...")
             
-            # Initial progress
+            # If there's a progress callback, send initial status
             if progress_callback:
                 progress_callback({
-                    'processed_urls': 0,
-                    'total_urls': max(1, len(instance.urls_to_visit)),
-                    'data_chunks': 0,
                     'phase': 'initializing',
-                    'sitemap_urls': len(instance.sitemap_urls)
+                    'processed_urls': 0,
+                    'total_urls': 0,
+                    'important_urls': 0
                 })
-                
-            # Crawl with progress updates - IMPORTANT: Pass None for url_limit to crawl everything
-            crawl_result = await instance.crawl(
-                progress_callback=progress_callback,
-                url_limit=None  # Force to None to ensure ALL pages are crawled
-            )
             
-            if not crawl_result.get('success'):
+            # Phase 1: Discover all URLs and identify important ones
+            phase1_result = await instance.phase1_discover_urls(progress_callback)
+            
+            if not phase1_result.get('success'):
                 return {
                     'success': False,
-                    'error': crawl_result.get('error', 'No data extracted from website'),
-                    'stored_count': crawl_result.get('stored_count', 0)
+                    'error': phase1_result.get('error', 'URL discovery failed'),
+                    'phase': 'discovery'
                 }
                 
+            # Exit early if no important URLs found
+            if len(instance.important_urls) == 0:
+                print(f"No important URLs found for {university_id}")
+                return {
+                    'success': True,
+                    'important_urls': 0,
+                    'stored_count': 0,
+                    'message': 'No important URLs found'
+                }
+                
+            # Phase 2: Process and store content from important URLs
+            phase2_result = await instance.phase2_process_important_urls(progress_callback)
+            
+            if not phase2_result.get('success'):
+                return {
+                    'success': False,
+                    'error': phase2_result.get('error', 'Processing important URLs failed'),
+                    'phase': 'processing',
+                    'important_urls': len(instance.important_urls)
+                }
+                
+            # Return combined results
             return {
                 'success': True,
-                'pages_crawled': crawl_result.get('pages_crawled', 0),
-                'total_pages': crawl_result.get('total_pages', 0),
-                'stored_count': crawl_result.get('stored_count', 0),
-                'sitemap_urls': len(instance.sitemap_urls)
+                'important_urls': len(instance.important_urls),
+                'stored_count': instance.stats['stored_chunks'],  # Make sure this matches expected keys
+                'pages_crawled': instance.stats['pages_crawled'],
+                'urls_discovered': instance.stats['urls_discovered']
             }
             
         except Exception as e:
             print(f"Error processing university {url}: {str(e)}")
             return {
                 'success': False,
-                'error': str(e),
-                'stored_count': 0
+                'error': str(e)
             }
             
     def __del__(self):
         """Cleanup method to ensure proper resource release"""
         try:
-            # Clear caches
-            if hasattr(self, 'embedding_cache'):
-                self.embedding_cache.clear()
-            
             # Clear collections
             if hasattr(self, 'visited_urls'):
                 self.visited_urls.clear()
@@ -812,6 +890,8 @@ class HybridCrawler:
                 self.urls_to_visit.clear()
             if hasattr(self, 'sitemap_urls'):
                 self.sitemap_urls.clear()
+            if hasattr(self, 'important_urls'):
+                self.important_urls.clear()
             if hasattr(self, 'extracted_data'):
                 self.extracted_data.clear()
                 
@@ -819,14 +899,67 @@ class HybridCrawler:
             logger.error(f"Error in cleanup: {str(e)}")
 
     @staticmethod
-    async def cleanup_university_data(university_id: str):
-        """Clean up university processing data from Redis"""
+    async def add_urls_to_process(university_id: str, urls: List[str]):
+        """Manually add URLs to process for a university"""
         try:
-            # Remove progress data
-            redis_client.delete(f"university_progress:{university_id}")
-            redis_client.delete(f"column_progress:{university_id}")
+            # Import MongoDB class here to avoid circular imports
+            from services.database import MongoDB
+            db = MongoDB(os.getenv('MONGODB_URI'))
             
-            return True
+            # Get existing important URLs
+            existing = db.db.important_urls.find_one({'university_id': university_id})
+            
+            if existing:
+                # Add new URLs
+                current_urls = set(existing.get('urls', []))
+                new_urls = [url for url in urls if url not in current_urls]
+                
+                # Update MongoDB
+                if new_urls:
+                    result = db.db.important_urls.update_one(
+                        {'university_id': university_id},
+                        {
+                            '$addToSet': {'urls': {'$each': new_urls}},
+                            '$inc': {'count': len(new_urls)},
+                            '$set': {'last_updated': datetime.utcnow()}
+                        }
+                    )
+                    
+                    return {
+                        'success': True,
+                        'added_urls': len(new_urls),
+                        'total_urls': len(current_urls) + len(new_urls)
+                    }
+                else:
+                    return {
+                        'success': True,
+                        'added_urls': 0,
+                        'message': 'All URLs already exist'
+                    }
+            else:
+                # Create new document
+                doc = {
+                    'university_id': university_id,
+                    'urls': urls,
+                    'count': len(urls),
+                    'added_at': datetime.utcnow(),
+                    'last_updated': datetime.utcnow(),
+                    'stats': {
+                        'urls_discovered': len(urls),
+                        'important_urls_found': len(urls)
+                    }
+                }
+                
+                db.db.important_urls.insert_one(doc)
+                
+                return {
+                    'success': True,
+                    'added_urls': len(urls)
+                }
+                
         except Exception as e:
-            logger.error(f"Error cleaning up university data: {str(e)}")
-            return False
+            logger.error(f"Error adding URLs to process: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
