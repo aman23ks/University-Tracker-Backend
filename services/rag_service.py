@@ -13,7 +13,7 @@ class RAGService:
         self.retriever = RAGRetrieval(
             openai_api_key=openai_api_key,
             pinecone_api_key=pinecone_api_key,
-            cohere_api_key=cohere_api_key,
+            # cohere_api_key=cohere_api_key,
             index_name=index_name
         )
         
