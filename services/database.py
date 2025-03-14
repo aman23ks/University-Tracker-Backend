@@ -1272,3 +1272,552 @@ class MongoDB:
         except Exception as e:
             logger.error(f"Error deleting feedback: {str(e)}")
             return False
+
+    def add_url_processing_record(self, data: Dict) -> Dict:
+        """Create a record of URL processing"""
+        try:
+            # Validate required fields
+            if 'urls' not in data or 'namespace' not in data:
+                return {'error': 'URLs and namespace are required'}
+                
+            # Add timestamp if not provided
+            if 'created_at' not in data:
+                data['created_at'] = datetime.utcnow()
+                
+            # Insert record
+            result = self.db.url_processing.insert_one(data)
+            
+            return {
+                'success': True,
+                'id': str(result.inserted_id)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error adding URL processing record: {str(e)}")
+            return {'error': str(e)}
+
+    def get_url_processing_records(self, limit: int = 100) -> List[Dict]:
+        """Get URL processing records"""
+        try:
+            # Get records ordered by creation time (newest first)
+            records = list(self.db.url_processing.find().sort('created_at', -1).limit(limit))
+            
+            # Format for response
+            for record in records:
+                record['id'] = str(record['_id'])
+                del record['_id']
+                
+                # Format dates
+                if 'created_at' in record:
+                    record['created_at'] = record['created_at'].isoformat()
+                if 'completed_at' in record:
+                    record['completed_at'] = record['completed_at'].isoformat()
+                    
+            return records
+            
+        except Exception as e:
+            logger.error(f"Error getting URL processing records: {str(e)}")
+            return []
+
+    def get_url_processing_record_by_task_id(self, task_id: str) -> Optional[Dict]:
+        """Get URL processing record by task ID"""
+        try:
+            record = self.db.url_processing.find_one({'task_id': task_id})
+            
+            if not record:
+                return None
+                
+            # Format for response
+            record['id'] = str(record['_id'])
+            del record['_id']
+            
+            # Format dates
+            if 'created_at' in record:
+                record['created_at'] = record['created_at'].isoformat()
+            if 'completed_at' in record:
+                record['completed_at'] = record['completed_at'].isoformat()
+                
+            return record
+            
+        except Exception as e:
+            logger.error(f"Error getting URL processing record: {str(e)}")
+            return None
+
+    def update_url_processing_status(self, task_id: str, status: str, metadata: Dict = None) -> Dict:
+        """Update the status of a URL processing task"""
+        try:
+            update_data = {'status': status}
+            
+            if status == 'completed':
+                update_data['completed_at'] = datetime.utcnow()
+                
+            if metadata:
+                update_data['metadata'] = metadata
+                
+            result = self.db.url_processing.update_one(
+                {'task_id': task_id},
+                {'$set': update_data}
+            )
+            
+            if result.matched_count == 0:
+                return {'error': 'Task not found'}
+                
+            return {'success': True}
+            
+        except Exception as e:
+            logger.error(f"Error updating URL processing status: {str(e)}")
+            return {'error': str(e)}
+
+    def log_query(self, data: Dict) -> Dict:
+        """Log a query for analytics purposes"""
+        try:
+            # Add timestamp if not provided
+            if 'timestamp' not in data:
+                data['timestamp'] = datetime.utcnow()
+                
+            # Insert record
+            result = self.db.query_logs.insert_one(data)
+            
+            return {
+                'success': True,
+                'id': str(result.inserted_id)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error logging query: {str(e)}")
+            return {'error': str(e)}
+
+    def get_query_analytics(self, days: int = 30) -> Dict:
+        """Get query analytics data"""
+        try:
+            cutoff_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Get total queries
+            total_queries = self.db.query_logs.count_documents({
+                'timestamp': {'$gte': cutoff_date}
+            })
+            
+            # Get queries by namespace
+            namespace_pipeline = [
+                {'$match': {'timestamp': {'$gte': cutoff_date}}},
+                {'$group': {
+                    '_id': '$namespace',
+                    'count': {'$sum': 1}
+                }},
+                {'$sort': {'count': -1}}
+            ]
+            namespaces = list(self.db.query_logs.aggregate(namespace_pipeline))
+            
+            # Get queries by user
+            user_pipeline = [
+                {'$match': {'timestamp': {'$gte': cutoff_date}}},
+                {'$group': {
+                    '_id': '$user_email',
+                    'count': {'$sum': 1}
+                }},
+                {'$sort': {'count': -1}}
+            ]
+            users = list(self.db.query_logs.aggregate(user_pipeline))
+            
+            # Get queries by day
+            day_pipeline = [
+                {'$match': {'timestamp': {'$gte': cutoff_date}}},
+                {'$group': {
+                    '_id': {
+                        'year': {'$year': '$timestamp'},
+                        'month': {'$month': '$timestamp'},
+                        'day': {'$dayOfMonth': '$timestamp'}
+                    },
+                    'count': {'$sum': 1}
+                }},
+                {'$sort': {'_id.year': 1, '_id.month': 1, '_id.day': 1}}
+            ]
+            days_data = list(self.db.query_logs.aggregate(day_pipeline))
+            
+            # Format days data
+            days_formatted = []
+            for day in days_data:
+                date_str = f"{day['_id']['year']}-{day['_id']['month']:02d}-{day['_id']['day']:02d}"
+                days_formatted.append({
+                    'date': date_str,
+                    'count': day['count']
+                })
+            
+            return {
+                'total_queries': total_queries,
+                'by_namespace': [{'namespace': item['_id'], 'count': item['count']} for item in namespaces],
+                'by_user': [{'user': item['_id'], 'count': item['count']} for item in users],
+                'by_day': days_formatted
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting query analytics: {str(e)}")
+            return {'error': str(e)}
+    
+    def get_namespace_by_name(self, name: str) -> Optional[Dict]:
+        """
+        Get namespace by name.
+        Works with both custom namespaces and university namespaces (uni_<id>)
+        """
+        try:
+            # Check if this is a university namespace
+            if name.startswith('uni_'):
+                # Extract university ID from namespace name
+                uni_id = name[4:]  # Remove 'uni_' prefix
+                
+                # Find the university
+                university = self.get_university_by_id(uni_id)
+                if not university:
+                    return None
+                    
+                # Create a namespace entry for this university
+                return {
+                    'id': name,  # Use the namespace name as ID
+                    'name': name,
+                    'description': f"Auto-generated namespace for {university.get('name', 'Unknown University')}",
+                    'created_at': university.get('created_at', datetime.utcnow()).isoformat() if isinstance(university.get('created_at', datetime.utcnow()), datetime) else university.get('created_at', datetime.utcnow()),
+                    'last_updated': university.get('last_updated', datetime.utcnow()).isoformat() if isinstance(university.get('last_updated', datetime.utcnow()), datetime) else university.get('last_updated', datetime.utcnow()),
+                    'is_university': True,
+                    'university_id': uni_id,
+                    'university_name': university.get('name', 'Unknown University'),
+                    'status': university.get('status', 'unknown'),
+                    'stats': {
+                        'vector_count': university.get('data_chunks', 0)
+                    }
+                }
+            
+            # Check if the namespaces collection exists
+            if 'namespaces' not in self.db.list_collection_names():
+                return None
+                
+            # Look for a custom namespace
+            namespace = self.db.namespaces.find_one({'name': name})
+            
+            if not namespace:
+                return None
+                
+            # Format for response
+            namespace['id'] = str(namespace['_id'])
+            del namespace['_id']
+            
+            # Format dates
+            if 'created_at' in namespace:
+                namespace['created_at'] = namespace['created_at'].isoformat() if isinstance(namespace['created_at'], datetime) else namespace['created_at']
+            if 'last_updated' in namespace:
+                namespace['last_updated'] = namespace['last_updated'].isoformat() if isinstance(namespace['last_updated'], datetime) else namespace['last_updated']
+                
+            return namespace
+            
+        except Exception as e:
+            logger.error(f"Error getting namespace by name: {str(e)}")
+            return None
+
+    
+    def get_namespaces(self) -> List[Dict]:
+        """
+        Get all namespaces, including:
+        1. Custom namespaces from the namespaces collection
+        2. Auto-generated namespaces from universities (uni_<id>)
+        """
+        try:
+            namespaces = []
+            
+            # First, get custom namespaces if the collection exists
+            if 'namespaces' in self.db.list_collection_names():
+                custom_namespaces = list(self.db.namespaces.find())
+                
+                # Format custom namespaces
+                for namespace in custom_namespaces:
+                    # Convert ObjectId to string
+                    namespace['id'] = str(namespace['_id'])
+                    del namespace['_id']
+                    
+                    # Format dates
+                    if 'created_at' in namespace:
+                        namespace['created_at'] = namespace['created_at'].isoformat() if isinstance(namespace['created_at'], datetime) else namespace['created_at']
+                    if 'last_updated' in namespace:
+                        namespace['last_updated'] = namespace['last_updated'].isoformat() if isinstance(namespace['last_updated'], datetime) else namespace['last_updated']
+                        
+                    namespaces.append(namespace)
+            
+            # Then, add university namespaces
+            universities = list(self.db.universities.find({}, {
+                'id': 1, 
+                'name': 1, 
+                'last_updated': 1,
+                'status': 1,
+                'data_chunks': 1
+            }))
+            
+            # Generate namespaces from universities
+            for uni in universities:
+                uni_id = uni.get('id') or str(uni.get('_id'))
+                uni_name = uni.get('name', 'Unknown University')
+                
+                # Create a namespace entry for this university
+                uni_namespace = {
+                    'id': f"uni_{uni_id}",  # Special ID format for university namespaces
+                    'name': f"uni_{uni_id}",
+                    'description': f"Auto-generated namespace for {uni_name}",
+                    'created_at': uni.get('created_at', datetime.utcnow()).isoformat() if isinstance(uni.get('created_at', datetime.utcnow()), datetime) else uni.get('created_at', datetime.utcnow()),
+                    'last_updated': uni.get('last_updated', datetime.utcnow()).isoformat() if isinstance(uni.get('last_updated', datetime.utcnow()), datetime) else uni.get('last_updated', datetime.utcnow()),
+                    'is_university': True,  # Mark as university namespace
+                    'university_id': uni_id,
+                    'university_name': uni_name,
+                    'status': uni.get('status', 'unknown'),
+                    'stats': {
+                        'vector_count': uni.get('data_chunks', 0)
+                    }
+                }
+                
+                namespaces.append(uni_namespace)
+                
+            return namespaces
+            
+        except Exception as e:
+            logger.error(f"Error getting namespaces: {str(e)}")
+            return []
+    
+    def get_namespace_by_id(self, namespace_id: str) -> Optional[Dict]:
+        """Get namespace by ID"""
+        try:
+            # Check if collection exists
+            if 'namespaces' not in self.db.list_collection_names():
+                return None
+                
+            # Convert string ID to ObjectId
+            from bson import ObjectId
+            obj_id = ObjectId(namespace_id)
+            
+            namespace = self.db.namespaces.find_one({'_id': obj_id})
+            
+            if not namespace:
+                return None
+                
+            # Format for response
+            namespace['id'] = str(namespace['_id'])
+            del namespace['_id']
+            
+            # Format dates
+            if 'created_at' in namespace:
+                namespace['created_at'] = namespace['created_at'].isoformat()
+            if 'last_updated' in namespace:
+                namespace['last_updated'] = namespace['last_updated'].isoformat()
+                
+            return namespace
+            
+        except Exception as e:
+            logger.error(f"Error getting namespace: {str(e)}")
+            return None
+    
+    def create_namespace(self, data: Dict) -> Dict:
+        """Create a custom namespace"""
+        try:
+            # Check if collection exists
+            if 'namespaces' not in self.db.list_collection_names():
+                self.db.create_collection('namespaces')
+                logger.info("Created namespaces collection")
+                
+            # Validate required fields
+            if 'name' not in data:
+                return {'error': 'Namespace name is required'}
+                
+            # Check if namespace already exists
+            existing = self.db.namespaces.find_one({'name': data['name']})
+            if existing:
+                return {'error': 'Namespace with this name already exists'}
+                
+            # Add timestamp if not provided
+            if 'created_at' not in data:
+                data['created_at'] = datetime.utcnow()
+            if 'last_updated' not in data:
+                data['last_updated'] = datetime.utcnow()
+                
+            # Insert namespace
+            result = self.db.namespaces.insert_one(data)
+            
+            return {
+                'success': True,
+                'id': str(result.inserted_id)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error creating namespace: {str(e)}")
+            return {'error': str(e)}
+
+    def delete_namespace(self, namespace_id: str) -> Dict:
+        """Delete a namespace"""
+        try:
+            # Don't allow deleting university namespaces
+            if namespace_id.startswith('uni_'):
+                return {'error': 'Cannot delete university namespaces'}
+            
+            # Check if collection exists
+            if 'namespaces' not in self.db.list_collection_names():
+                return {'error': 'Namespace collection does not exist'}
+                
+            # Convert string ID to ObjectId
+            from bson import ObjectId
+            try:
+                obj_id = ObjectId(namespace_id)
+            except:
+                return {'error': 'Invalid namespace ID format'}
+            
+            # Check if namespace exists
+            namespace = self.db.namespaces.find_one({'_id': obj_id})
+            if not namespace:
+                return {'error': 'Namespace not found'}
+                
+            # Delete namespace
+            result = self.db.namespaces.delete_one({'_id': obj_id})
+            
+            if result.deleted_count == 0:
+                return {'error': 'Failed to delete namespace'}
+                
+            return {
+                'success': True,
+                'deleted_count': result.deleted_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Error deleting namespace: {str(e)}")
+            return {'error': str(e)}
+
+    def update_namespace(self, namespace_id: str, data: Dict) -> Dict:
+        """Update a namespace"""
+        try:
+            # Check if collection exists
+            if 'namespaces' not in self.db.list_collection_names():
+                return {'error': 'Namespace collection does not exist'}
+                
+            # Convert string ID to ObjectId
+            from bson import ObjectId
+            try:
+                obj_id = ObjectId(namespace_id)
+            except:
+                return {'error': 'Invalid namespace ID format'}
+            
+            # Check if namespace exists
+            namespace = self.db.namespaces.find_one({'_id': obj_id})
+            if not namespace:
+                return {'error': 'Namespace not found'}
+                
+            # Don't allow name changes if it would conflict
+            if 'name' in data and data['name'] != namespace.get('name', ''):
+                existing = self.db.namespaces.find_one({'name': data['name']})
+                if existing:
+                    return {'error': 'Another namespace with this name already exists'}
+                    
+            # Add updated timestamp
+            data['last_updated'] = datetime.utcnow()
+            
+            # Update namespace
+            result = self.db.namespaces.update_one(
+                {'_id': obj_id},
+                {'$set': data}
+            )
+            
+            if result.matched_count == 0:
+                return {'error': 'Namespace not found'}
+                
+            return {
+                'success': True,
+                'modified_count': result.modified_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating namespace: {str(e)}")
+            return {'error': str(e)}
+    
+    def get_namespace_by_id(self, namespace_id: str) -> Optional[Dict]:
+        """
+        Get namespace by ID.
+        Works with both custom namespaces and university namespaces.
+        """
+        try:
+            # Check if this is a university namespace ID
+            if namespace_id.startswith('uni_'):
+                # Extract university ID
+                uni_id = namespace_id[4:]
+                
+                # Get the university
+                university = self.get_university_by_id(uni_id)
+                if not university:
+                    return None
+                    
+                # Create a namespace entry for this university
+                return {
+                    'id': namespace_id,
+                    'name': namespace_id,
+                    'description': f"Auto-generated namespace for {university.get('name', 'Unknown University')}",
+                    'created_at': university.get('created_at', datetime.utcnow()).isoformat() if isinstance(university.get('created_at', datetime.utcnow()), datetime) else university.get('created_at', datetime.utcnow()),
+                    'last_updated': university.get('last_updated', datetime.utcnow()).isoformat() if isinstance(university.get('last_updated', datetime.utcnow()), datetime) else university.get('last_updated', datetime.utcnow()),
+                    'is_university': True,
+                    'university_id': uni_id,
+                    'university_name': university.get('name', 'Unknown University'),
+                    'status': university.get('status', 'unknown'),
+                    'stats': {
+                        'vector_count': university.get('data_chunks', 0)
+                    }
+                }
+                
+            # Check if collection exists
+            if 'namespaces' not in self.db.list_collection_names():
+                return None
+                
+            # Convert string ID to ObjectId
+            from bson import ObjectId
+            try:
+                obj_id = ObjectId(namespace_id)
+            except:
+                return None
+            
+            namespace = self.db.namespaces.find_one({'_id': obj_id})
+            
+            if not namespace:
+                return None
+                
+            # Format for response
+            namespace['id'] = str(namespace['_id'])
+            del namespace['_id']
+            
+            # Format dates
+            if 'created_at' in namespace:
+                namespace['created_at'] = namespace['created_at'].isoformat() if isinstance(namespace['created_at'], datetime) else namespace['created_at']
+            if 'last_updated' in namespace:
+                namespace['last_updated'] = namespace['last_updated'].isoformat() if isinstance(namespace['last_updated'], datetime) else namespace['last_updated']
+                
+            return namespace
+            
+        except Exception as e:
+            logger.error(f"Error getting namespace by ID: {str(e)}")
+            return None
+
+    def update_url_processing_statuses(self, urls: List[str], status: str, university_id: str):
+        """Update processing status for multiple URLs at once"""
+        try:
+            operations = []
+            timestamp = datetime.utcnow()
+            
+            for url in urls:
+                operations.append(
+                    UpdateOne(
+                        {'url': url, 'university_id': university_id},
+                        {'$set': {'status': status, 'updated_at': timestamp}},
+                        upsert=True
+                    )
+                )
+            
+            if operations:
+                result = self.db.url_processing_status.bulk_write(operations)
+                return {
+                    'success': True,
+                    'modified': result.modified_count,
+                    'upserted': result.upserted_count
+                }
+            
+            return {'success': True, 'modified': 0, 'upserted': 0}
+            
+        except Exception as e:
+            logger.error(f"Error updating URL processing statuses: {str(e)}")
+            return {'error': str(e)}

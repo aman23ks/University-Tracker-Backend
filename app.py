@@ -24,7 +24,7 @@ import time
 from flask_cors import CORS
 from datetime import datetime, timezone, timedelta
 from services.analytics import get_monthly_growth, get_user_activity, get_total_revenue
-from services.celery_worker import process_custom_columns_task, process_pending_columns_task, process_university_background
+from services.celery_worker import process_custom_columns_task, process_pending_columns_task, process_university_background, process_urls_task
 from flask_socketio import SocketIO, emit, disconnect
 from services.socket_service import socketio
 from engineio.payload import Payload
@@ -90,7 +90,7 @@ def get_services():
     rag = RAGRetrieval(
         openai_api_key=os.getenv('OPENAI_API_KEY'),
         pinecone_api_key=os.getenv('PINECONE_API_KEY'),
-        cohere_api_key=os.getenv('COHERE_API_KEY'),
+        # cohere_api_key=os.getenv('COHERE_API_KEY'),
         index_name=os.getenv('INDEX_NAME')
     )
     payment = PaymentService(
@@ -625,6 +625,20 @@ def delete_university(id):
         except Exception as e:
             app.logger.error(f"Error deleting from Pinecone: {str(e)}")
             # Continue with database deletion even if Pinecone deletion fails
+
+        # Delete from important_urls collection
+        try:
+            db.db.important_urls.delete_one({'university_id': id})
+            app.logger.info(f"Deleted from important_urls for university {id}")
+        except Exception as e:
+            app.logger.error(f"Error deleting from important_urls: {str(e)}")
+            
+        # Delete from university_urls collection (newer format)
+        try:
+            db.db.university_urls.delete_many({'university_id': id})
+            app.logger.info(f"Deleted from university_urls for university {id}")
+        except Exception as e:
+            app.logger.error(f"Error deleting from university_urls: {str(e)}")
 
         # Delete from database
         result = db.delete_university(id)
@@ -1751,6 +1765,351 @@ def get_feedback_stats():
     except Exception as e:
         app.logger.error(f"Error getting feedback stats: {str(e)}")
         return jsonify({'error': 'Failed to get feedback statistics'}), 500
+
+# Add these routes to app.py for namespace and URL processing
+
+@app.route('/api/admin/namespaces', methods=['GET'])
+@jwt_required()
+def get_all_namespaces():
+    """Get all namespaces"""
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        # Admin only
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        namespaces = db.get_namespaces()
+        
+        # Get Pinecone stats for each namespace
+        try:
+            index = crawler.index
+            stats = index.describe_index_stats()
+            
+            # Add vector counts to response
+            if stats and hasattr(stats, 'namespaces'):
+                for namespace in namespaces:
+                    ns_name = namespace.get('name')
+                    if ns_name in stats.namespaces:
+                        namespace['stats'] = {
+                            'vector_count': stats.namespaces[ns_name].vector_count
+                        }
+                    else:
+                        namespace['stats'] = {
+                            'vector_count': 0
+                        }
+        except Exception as e:
+            app.logger.error(f"Error getting Pinecone stats: {str(e)}")
+            # Continue without stats if Pinecone call fails
+            
+        return jsonify(namespaces)
+        
+    except Exception as e:
+        app.logger.error(f"Error getting namespaces: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/namespaces', methods=['POST'])
+@jwt_required()
+def create_namespace():
+    """Create a new namespace"""
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        # Admin only
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        data = request.json
+        if not data or 'name' not in data:
+            return jsonify({'error': 'Namespace name is required'}), 400
+            
+        # Create namespace
+        namespace_data = {
+            'name': data['name'],
+            'description': data.get('description', ''),
+            'created_by': current_user,
+            'created_at': datetime.utcnow(),
+            'last_updated': datetime.utcnow()
+        }
+        
+        result = db.create_namespace(namespace_data)
+        
+        if result.get('error'):
+            return jsonify(result), 400
+            
+        # Get the created namespace
+        namespace = db.get_namespace_by_id(result['id'])
+        
+        return jsonify({
+            'success': True,
+            'message': 'Namespace created successfully',
+            'namespace': namespace
+        }), 201
+        
+    except Exception as e:
+        app.logger.error(f"Error creating namespace: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/namespaces/<string:namespace_id>', methods=['DELETE'])
+@jwt_required()
+def delete_namespace_by_id(namespace_id):
+    """Delete a namespace"""
+    try:
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        
+        # Admin only
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        # Get namespace to check if it exists
+        namespace = db.get_namespace_by_id(namespace_id)
+        if not namespace:
+            return jsonify({'error': 'Namespace not found'}), 404
+            
+        # Don't allow deleting university namespaces
+        if namespace['name'].startswith('uni_'):
+            return jsonify({'error': 'Cannot delete university namespaces'}), 400
+            
+        # Delete from Pinecone first
+        try:
+            index = crawler.index
+            index.delete(
+                delete_all=True,
+                namespace=namespace['name']
+            )
+        except Exception as e:
+            app.logger.error(f"Error deleting from Pinecone: {str(e)}")
+            # Continue with database deletion even if Pinecone fails
+            
+        # Delete from database
+        result = db.delete_namespace(namespace_id)
+        
+        if result.get('error'):
+            return jsonify(result), 400
+            
+        return jsonify({
+            'success': True,
+            'message': 'Namespace deleted successfully'
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error deleting namespace: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/urls/process', methods=['POST'])
+@jwt_required()
+def process_admin_urls():
+    """Process specific URLs provided by admin and store them directly"""
+    try:
+        # Verify admin access
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        data = request.json
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        urls = data.get('urls')
+        namespace = data.get('namespace')
+        university_id = data.get('university_id')
+        
+        if not urls or not isinstance(urls, list) or len(urls) == 0:
+            return jsonify({'error': 'URLs must be a non-empty list'}), 400
+            
+        if not namespace:
+            return jsonify({'error': 'Namespace is required'}), 400
+            
+        # Get university to determine program
+        university = db.get_university_by_id(university_id)
+        if not university:
+            return jsonify({'error': 'University not found'}), 404
+            
+        program = university.get('programs', ['MS CS'])[0] if isinstance(university.get('programs'), list) else 'MS CS'
+        
+        # Schedule task for processing these URLs directly
+        task = process_urls_task.delay(
+            urls=urls,
+            namespace=namespace,
+            university_id=university_id,
+            user_email=current_user
+        )
+        
+        # Store URLs in the important_urls collection
+        try:
+            existing = db.db.important_urls.find_one({'university_id': university_id})
+            if existing:
+                # Add new URLs to existing important URLs
+                db.db.important_urls.update_one(
+                    {'university_id': university_id},
+                    {
+                        '$addToSet': {'urls': {'$each': urls}},
+                        '$inc': {'count': len(urls)},
+                        '$set': {'last_updated': datetime.utcnow()}
+                    }
+                )
+                app.logger.info(f"Added {len(urls)} manual URLs to existing important_urls for {university_id}")
+            else:
+                # Create new important_urls entry
+                db.db.important_urls.insert_one({
+                    'university_id': university_id,
+                    'urls': urls,
+                    'count': len(urls),
+                    'root_url': university.get('url', ''),
+                    'program': program,
+                    'added_at': datetime.utcnow(),
+                    'last_updated': datetime.utcnow(),
+                    'added_by': current_user,
+                    'source': 'manual'
+                })
+                app.logger.info(f"Created new important_urls entry with {len(urls)} manual URLs for {university_id}")
+        except Exception as e:
+            app.logger.error(f"Error storing important URLs: {str(e)}")
+            # Continue with task even if storing fails
+        
+        # Also update university record
+        db.update_university(university_id, {
+            'manually_added_urls': True,
+            'manual_urls_count': len(urls),
+            'last_updated': datetime.utcnow()
+        })
+        
+        return jsonify({
+            'success': True,
+            'message': f'Processing {len(urls)} URLs',
+            'task_id': task.id
+        }), 202
+        
+    except Exception as e:
+        app.logger.error(f"Error processing admin URLs: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/urls/add-important', methods=['POST'])
+@jwt_required()
+def add_important_urls():
+    """Add URLs to the important_urls collection without processing them"""
+    try:
+        # Verify admin access
+        current_user = get_jwt_identity()
+        user = db.get_user(current_user)
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        data = request.json
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        urls = data.get('urls')
+        university_id = data.get('university_id')
+        
+        if not urls or not isinstance(urls, list) or len(urls) == 0:
+            return jsonify({'error': 'URLs must be a non-empty list'}), 400
+            
+        if not university_id:
+            return jsonify({'error': 'University ID is required'}), 400
+            
+        # Get university
+        university = db.get_university_by_id(university_id)
+        if not university:
+            return jsonify({'error': 'University not found'}), 404
+            
+        program = university.get('programs', ['MS CS'])[0] if isinstance(university.get('programs'), list) else 'MS CS'
+        
+        # Store URLs in the important_urls collection
+        existing = db.db.important_urls.find_one({'university_id': university_id})
+        if existing:
+            # Filter out duplicates before adding
+            existing_urls = set(existing.get('urls', []))
+            new_urls = [url for url in urls if url not in existing_urls]
+            
+            if new_urls:
+                db.db.important_urls.update_one(
+                    {'university_id': university_id},
+                    {
+                        '$addToSet': {'urls': {'$each': new_urls}},
+                        '$inc': {'count': len(new_urls)},
+                        '$set': {'last_updated': datetime.utcnow()}
+                    }
+                )
+                app.logger.info(f"Added {len(new_urls)} new URLs to important_urls for {university_id}")
+                return jsonify({
+                    'success': True,
+                    'added': len(new_urls),
+                    'total': len(existing_urls) + len(new_urls)
+                })
+            else:
+                return jsonify({
+                    'success': True,
+                    'added': 0,
+                    'message': 'All URLs already exist',
+                    'total': len(existing_urls)
+                })
+        else:
+            # Create new important_urls entry
+            db.db.important_urls.insert_one({
+                'university_id': university_id,
+                'urls': urls,
+                'count': len(urls),
+                'root_url': university.get('url', ''),
+                'program': program,
+                'added_at': datetime.utcnow(),
+                'last_updated': datetime.utcnow(),
+                'added_by': current_user,
+                'source': 'manual'
+            })
+            app.logger.info(f"Created new important_urls entry with {len(urls)} URLs for {university_id}")
+            
+            return jsonify({
+                'success': True,
+                'added': len(urls),
+                'total': len(urls)
+            })
+            
+    except Exception as e:
+        app.logger.error(f"Error adding important URLs: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+ 
+@app.route('/api/query/<string:namespace>', methods=['POST'])
+@jwt_required()
+def query_custom_namespace(namespace):
+    """Query a custom namespace"""
+    try:
+        data = request.json
+        if not data or 'query' not in data:
+            return jsonify({'error': 'Query is required'}), 400
+            
+        # Check if namespace exists
+        namespace_obj = db.get_namespace_by_name(namespace)
+        if not namespace_obj and not namespace.startswith('uni_'):
+            return jsonify({'error': 'Namespace not found'}), 404
+            
+        # Get response from RAG service
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(rag.query(data['query'], namespace))
+        loop.close()
+        
+        # Log the query for analytics
+        db.log_query({
+            'user_email': get_jwt_identity(),
+            'query': data['query'],
+            'namespace': namespace,
+            'timestamp': datetime.utcnow(),
+            'matches_found': result.get('matches_found', 0)
+        })
+        
+        if 'error' in result:
+            return jsonify({'error': result['error']}), 500
+            
+        return jsonify(result)
+        
+    except Exception as e:
+        app.logger.error(f"Error querying namespace: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.errorhandler(500)
 def handle_500_error(e):

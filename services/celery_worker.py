@@ -11,6 +11,9 @@ from services.rag_retrieval import RAGRetrieval
 from functools import wraps
 from services.redis_fix import get_redis_connection
 import time
+import aiohttp
+from bs4 import BeautifulSoup
+from typing import List
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -70,7 +73,7 @@ db = MongoDB(os.getenv('MONGODB_URI'))
 rag = RAGRetrieval(
     openai_api_key=os.getenv('OPENAI_API_KEY'),
     pinecone_api_key=os.getenv('PINECONE_API_KEY'),
-    cohere_api_key=os.getenv('COHERE_API_KEY'),
+    # cohere_api_key=os.getenv('COHERE_API_KEY'),
     index_name=os.getenv('INDEX_NAME')
 )
 
@@ -111,7 +114,7 @@ def store_progress(university_id: str, status: dict, ttl: int = 3600):
         logger.error(f"Error storing progress: {str(e)}")
 
 @celery.task(bind=True, name='services.celery_worker.process_university_background')
-def process_university_background(self, url: str, program: str, university_id: str, url_limit: int = 15, email=None):
+def process_university_background(self, url: str, program: str, university_id: str, url_limit: int = 20000, email=None):
     logger.info(f"Starting processing for university {university_id} with URL: {url}")
     
     try:
@@ -706,3 +709,152 @@ def process_pending_columns_task(self, user_email: str):
     except Exception as e:
         logger.error(f"Error processing pending columns: {str(e)}")
         return {'error': str(e)}
+    
+@celery.task(bind=True, name='services.celery_worker.process_urls_task')
+def process_urls_task(self, urls: List[str] = None, namespace: str = None, university_id: str = None, user_email: str = None):
+    """
+    Process specific URLs and store their content in the specified namespace
+    
+    Args:
+        urls: List of URLs to process
+        namespace: Vector database namespace
+        university_id: University ID
+        user_email: User email for tracking
+    
+    Returns:
+        Processing results
+    """
+    logger.info(f"Processing {len(urls) if urls else 0} URLs for namespace: {namespace}")
+    
+    try:
+        if not urls:
+            return {
+                'success': False,
+                'error': 'No URLs provided'
+            }
+            
+        if not namespace:
+            namespace = f"uni_{university_id}" if university_id else "custom_namespace"
+            
+        # Get university details if available
+        university_info = {}
+        program = "MS CS"  # Default program
+        
+        if university_id:
+            try:
+                university = db.get_university_by_id(university_id)
+                if university:
+                    university_info = {
+                        'name': university.get('name', ''),
+                        'url': university.get('url', '')
+                    }
+                    program = university.get('programs', ['MS CS'])[0] if isinstance(university.get('programs'), list) else 'MS CS'
+            except Exception as uni_err:
+                logger.error(f"Error getting university info: {str(uni_err)}")
+        
+        # Initialize progress tracking
+        task_id = self.request.id
+        
+        # Update task status to processing in database
+        db.update_url_processing_status(
+            task_id=task_id,
+            status='processing',
+            metadata={
+                'total_urls': len(urls),
+                'processed_urls': 0,
+                'stored_chunks': 0,
+                'start_time': datetime.utcnow().isoformat()
+            }
+        )
+        
+        # Process URLs using HybridCrawler's specialized method
+        # Using a direct function call with asyncio.run rather than creating a crawler instance
+        # to avoid the issues with forking processes
+        crawler = HybridCrawler(
+            openai_api_key=os.getenv('OPENAI_API_KEY'),
+            pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+            index_name=os.getenv('INDEX_NAME')
+        )
+        
+        # Process URLs
+        result = asyncio.run(HybridCrawler.process_specific_urls(
+            urls=urls,
+            university_id=university_id,
+            program=program,
+            namespace=namespace
+        ))
+        
+        # Update task as completed
+        completion_status = 'completed' if result.get('success') else 'failed'
+        
+        db.update_url_processing_status(
+            task_id=task_id,
+            status=completion_status,
+            metadata={
+                'total_urls': len(urls),
+                'processed_urls': result.get('processed', 0),
+                'failed_urls': result.get('failed', 0),
+                'stored_chunks': result.get('stored_chunks', 0),
+                'failures': result.get('failures', []),
+                'completed_at': datetime.utcnow().isoformat()
+            }
+        )
+        
+        # If this was for a university, update the university record
+        if university_id:
+            update_data = {
+                'metadata': {
+                    'last_url_processing': {
+                        'timestamp': datetime.utcnow(),
+                        'urls_processed': result.get('processed', 0),
+                        'stored_chunks': result.get('stored_chunks', 0),
+                        'namespace': namespace
+                    }
+                }
+            }
+            
+            # If URLs were successfully processed, update university status
+            if result.get('success') and result.get('stored_chunks', 0) > 0:
+                update_data['status'] = 'completed'
+                
+            db.update_university(university_id, update_data)
+            
+            # Send status update via Redis for real-time updates
+            try:
+                from services.event_handler import publish_status_update
+                publish_status_update(university_id, completion_status, {
+                    'message': f"Processed {result.get('processed', 0)} URLs with {result.get('stored_chunks', 0)} chunks",
+                    'urls_processed': result.get('processed', 0),
+                    'stored_chunks': result.get('stored_chunks', 0)
+                })
+            except Exception as notify_err:
+                logger.error(f"Error publishing status update: {str(notify_err)}")
+        
+        # Return processing results
+        return {
+            'success': result.get('success', False),
+            'processed_urls': result.get('processed', 0),
+            'stored_chunks': result.get('stored_chunks', 0),
+            'failed_urls': result.get('failed', 0),
+            'namespace': namespace
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing URLs: {str(e)}")
+        
+        # Update task as failed
+        try:
+            db.update_url_processing_status(
+                task_id=self.request.id,
+                status='failed',
+                metadata={
+                    'error': str(e)
+                }
+            )
+        except Exception as update_err:
+            logger.error(f"Error updating task status: {str(update_err)}")
+        
+        return {
+            'success': False,
+            'error': str(e)
+        }
