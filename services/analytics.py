@@ -19,8 +19,8 @@ def get_total_revenue(db) -> float:
             'subscription.status': 'active'
         })
         
-        # Calculate total revenue (₹1000 per premium user)
-        total_revenue = premium_users * 1000
+        # Calculate total revenue (₹299 per premium user)
+        total_revenue = premium_users * 299
         return total_revenue
         
     except Exception as e:
