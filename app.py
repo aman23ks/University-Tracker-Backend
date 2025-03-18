@@ -1178,7 +1178,7 @@ def create_subscription_order():
         print(f"Creating order for user: {user_email}")
         
         # Fixed amount for premium subscription (₹20 = 2000 paise)
-        amount = 100000
+        amount = 29900
         
         order_response = payment.create_order(amount, user_email)
         if not order_response['success']:
