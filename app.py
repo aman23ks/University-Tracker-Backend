@@ -59,6 +59,9 @@ redis_host = os.getenv('REDISHOST', os.getenv('REDIS_HOST', 'localhost'))
 redis_port = int(os.getenv('REDISPORT', os.getenv('REDIS_PORT', 6379)))
 redis_url = os.getenv('REDIS_URL', f'redis://{redis_host}:{redis_port}/0')
 
+# Subscription: Set to true when ready to monitize
+ENABLE_PREMIUM_RESTRICTIONS = False
+
 # Initialize Redis client for the app
 try:
     redis_client = get_redis_connection()
@@ -1301,6 +1304,65 @@ def check_subscription_status():
             return jsonify({'error': 'User not found'}), 404
 
         # Check if subscription has expired
+        if not ENABLE_PREMIUM_RESTRICTIONS:
+            if user.get('subscription'):
+                expiry = user['subscription'].get('expiry')
+                if expiry:
+                    # Ensure date is in UTC format
+                    if isinstance(expiry, datetime):
+                        expiry_date = expiry.replace(tzinfo=timezone.utc)
+                    else:
+                        # Parse string date to datetime with timezone
+                        expiry_date = datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+                        
+                    current_time = datetime.now(timezone.utc)
+
+                    # Check if subscription has expired
+                    if current_time > expiry_date:
+                        app.logger.info(f"Subscription expired for user {user_email}")
+                        
+                        # Update user status to expired
+                        db.update_user(user_email, {
+                            'is_premium': False,
+                            'subscription': {
+                                'status': 'expired',
+                                'expiry': expiry,
+                                'payment_history': user['subscription'].get('payment_history', [])
+                            }
+                        })
+                        
+                        # Hide universities beyond the free limit (only first 3 remain visible)
+                        visibility_result = db.update_user_university_visibility(user_email, False)
+                        app.logger.info(f"Updated university visibility: {visibility_result}")
+                        
+                        return jsonify({
+                            'is_premium': False,
+                            'subscription': {
+                                'status': 'expired',
+                                'expiry': expiry.isoformat() if isinstance(expiry, datetime) else expiry
+                            },
+                            'visibility_updated': True
+                        })
+                    else:
+                        # Subscription still active, make sure all universities are visible
+                        db.update_user_university_visibility(user_email, True)
+
+            # Get latest visibility data
+            visibility_data = db.get_university_visibility_stats(user_email)
+            
+            # Return current status
+            return jsonify({
+                'is_premium': user.get('is_premium', False),
+                'subscription': user.get('subscription', {'status': 'free'}),
+                'visibility': {
+                    'total_universities': visibility_data.get('total_count', 0),
+                    'visible_universities': visibility_data.get('visible_count', 0),
+                    'hidden_universities': visibility_data.get('hidden_count', 0)
+                }
+            })
+        
+        # Subscription: Remove all code in between
+        # Original subscription check logic (only runs when ENABLE_PREMIUM_RESTRICTIONS = True)
         if user.get('subscription'):
             expiry = user['subscription'].get('expiry')
             if expiry:
@@ -1356,6 +1418,7 @@ def check_subscription_status():
                 'hidden_universities': visibility_data.get('hidden_count', 0)
             }
         })
+        ###################
         
     except Exception as e:
         app.logger.error(f"Error checking subscription status: {str(e)}")

@@ -13,6 +13,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+# Subscription: Update to true to make everything work
+ENABLE_PREMIUM_RESTRICTIONS = False
+
 class MongoDB:
     def __init__(self, uri: str = 'mongodb://localhost:27017/'):
         """Fork-safe initialization"""
@@ -56,10 +59,12 @@ class MongoDB:
             if self.db.users.find_one({'email': data['email']}):  # Changed from users
                 return {'error': 'Email already exists'}
             
+            
+            is_premium = not ENABLE_PREMIUM_RESTRICTIONS 
             user = {
                 'email': data['email'],
                 'password': generate_password_hash(data['password']),
-                'is_premium': False,
+                'is_premium': is_premium,
                 'is_admin': data['email'].endswith('@admin.com'),
                 'selected_universities': [],
                 'university_selections': [],
@@ -303,8 +308,10 @@ class MongoDB:
                 if university_url in current_universities:
                     return {'error': 'University already selected'}
 
+                enforce_limit = ENABLE_PREMIUM_RESTRICTIONS
+                
                 # Check free tier limit
-                if not user.get('is_premium') and len(current_universities) >= 3:
+                if enforce_limit and not user.get('is_premium') and len(current_universities) >= 3:
                     return {'error': 'Free tier limit reached'}
 
                 # Add university
@@ -847,6 +854,8 @@ class MongoDB:
             if not user:
                 return {'error': 'User not found'}
                 
+            if not ENABLE_PREMIUM_RESTRICTIONS:
+                is_premium = True
             # Get all selected university URLs
             selected_urls = user.get('selected_universities', [])
             if not selected_urls:
