@@ -325,7 +325,8 @@ class RAGRetrieval:
                         4. When multiple sources provide similar information, cite all relevant sources
                         5. When discussing requirements like GRE/TOEFL scores, tuition fees, or deadlines, be precise with numbers
                         6. If the context doesn't contain the answer, honestly state that you cannot find the information
-
+                        7. Remember to reply for only Masters of Science (MS) in Computer Science (CS/CSE) program and do not include information related to undegrad and phd. 
+                        
                         For example, instead of just saying "The program requires a GRE score of 300." say "The program requires a GRE score of 300 [SOURCE-2]."
                         """
                     },
