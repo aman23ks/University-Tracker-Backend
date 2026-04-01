@@ -68,14 +68,22 @@ celery.conf.update(
     worker_concurrency=2
 )
 
+from celery.signals import worker_process_init
+
 # Initialize services in worker
-db = MongoDB(os.getenv('MONGODB_URI'))
-rag = RAGRetrieval(
-    openai_api_key=os.getenv('OPENAI_API_KEY'),
-    pinecone_api_key=os.getenv('PINECONE_API_KEY'),
-    # cohere_api_key=os.getenv('COHERE_API_KEY'),
-    index_name=os.getenv('INDEX_NAME')
-)
+db = None
+rag = None
+
+@worker_process_init.connect
+def init_worker(**kwargs):
+    global db, rag
+    db = MongoDB(os.getenv('MONGODB_URI'))
+    rag = RAGRetrieval(
+        openai_api_key=os.getenv('OPENAI_API_KEY'),
+        pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+        index_name=os.getenv('INDEX_NAME')
+    )
+
 
 def ensure_db_connection(f):
     @wraps(f)

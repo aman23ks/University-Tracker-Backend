@@ -9,6 +9,7 @@ import asyncio
 import threading
 import time
 from dotenv import load_dotenv
+load_dotenv()
 from services.database import MongoDB
 from services.rag_retrieval import RAGRetrieval
 from services.payment_service import PaymentService
@@ -17,14 +18,13 @@ from datetime import datetime, timezone
 from bson import json_util, ObjectId
 import json
 from typing import List, Dict
-from dotenv import load_dotenv
 import os
 import redis
 import time
 from flask_cors import CORS
 from datetime import datetime, timezone, timedelta
 from services.analytics import get_monthly_growth, get_user_activity, get_total_revenue
-from services.celery_worker import process_custom_columns_task, process_pending_columns_task, process_university_background, process_urls_task
+from services.celery_worker import process_custom_columns_task, process_pending_columns_task, process_university_background, process_urls_task, celery
 from flask_socketio import SocketIO, emit, disconnect
 from services.socket_service import socketio
 from engineio.payload import Payload
@@ -33,11 +33,10 @@ from services.event_handler import redis_client, publish_status_update
 from services.redis_fix import get_redis_connection
 
 
-load_dotenv()
 app = Flask(__name__)
 Payload.max_decode_packets = 50
 # Configure app
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET')
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', os.getenv('JWT_SECRET'))
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
 app.config['CORS_HEADERS'] = 'Content-Type'
 
